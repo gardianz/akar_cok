@@ -5896,23 +5896,26 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       swapsFail: String(skippedTx)
     });
 
+    const hasMoreTxAfterCurrent = index < sendRequests.length - 1 && !recipientCandidateMode;
+
+    // Delay after every successful transaction, including the last tx in a batch.
+    if (delayTxMaxSec > 0) {
+      const delayTxSec = randomIntInclusive(delayTxMinSec, delayTxMaxSec);
+      const delayTargetLabel = hasMoreTxAfterCurrent ? "next tx" : "balance refresh";
+      console.log(`[info] Waiting ${delayTxSec}s after successful tx before ${delayTargetLabel}...`);
+      dashboard.setState({
+        phase: "cooldown",
+        cooldown: `${delayTxSec}s`,
+        send: `Post-success cooldown ${delayTxSec}s before ${delayTargetLabel}`
+      });
+      await sleep(delayTxSec * 1000);
+    }
+
     if (recipientCandidateMode && completedTx >= expectedTxCount) {
       console.log(
         `[info] Internal recipient selected via candidate ${index + 1}/${sendRequests.length}: ${sendRequest.label}`
       );
       break;
-    }
-
-    // Delay between transactions (skip after last tx)
-    if (index < sendRequests.length - 1 && delayTxMaxSec > 0) {
-      const delayTxSec = randomIntInclusive(delayTxMinSec, delayTxMaxSec);
-      console.log(`[info] Waiting ${delayTxSec}s before next tx...`);
-      dashboard.setState({
-        phase: "cooldown",
-        cooldown: `${delayTxSec}s`,
-        send: `Cooldown ${delayTxSec}s before next tx`
-      });
-      await sleep(delayTxSec * 1000);
     }
   }
 
