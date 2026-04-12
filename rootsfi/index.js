@@ -26,6 +26,7 @@ try {
 const DEFAULT_CONFIG_FILE = "config.json";
 const DEFAULT_ACCOUNTS_FILE = "accounts.json";
 const DEFAULT_TOKENS_FILE = "tokens.json";
+const DEFAULT_INTERNAL_PLANNER_STATE_FILE = "internal-planner-state.json";
 
 const rawBrowserChallengeConcurrency = Number(process.env.ROOTSFI_MAX_BROWSER_CONCURRENCY);
 const BROWSER_CHALLENGE_MAX_CONCURRENT =
@@ -196,12 +197,13 @@ async function resetConnectionPool(options = {}) {
 }
 
 // ============================================================================
-// ADAPTIVE INTERNAL RECIPIENT STRATEGY
+// COVERAGE-FIRST INTERNAL RECIPIENT STRATEGY
 // ============================================================================
 // Goals:
-// - Recipient tidak monoton (rotating offset per round)
+// - Setiap sender eventually mengirim ke semua recipient internal lain
+// - Urutan recipient tetap acak (shuffled per coverage epoch)
 // - Hindari kirim balik langsung ke sender sebelumnya (server cooldown 10m)
-// - Tetap support fallback recipient saat candidate utama cooldown
+// - Tetap support fallback recipient saat target coverage sedang cooldown
 // ============================================================================
 
 const SEND_PAIR_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
@@ -211,6 +213,11 @@ const SEND_PAIR_COOLDOWN_BUFFER_SECONDS = 45; // Safety buffer near expiry
 const sendPairHistory = new Map();
 // key: "sender=>recipient", value: block-until timestamp (ms)
 const reciprocalSendCooldowns = new Map();
+// key: senderName, value: { rosterKey, epoch, pendingRecipients[] }
+const internalCoverageQueues = new Map();
+let internalPlannerStatePath = "";
+let internalPlannerValidAccountNames = new Set();
+let internalPlannerStateSaveQueue = Promise.resolve();
 
 let roundRobinOffset = 0;
 let lastRoundPrimaryOffset = 0;
@@ -239,6 +246,321 @@ function cleanupExpiredSendPairs() {
       reciprocalSendCooldowns.delete(pairKey);
     }
   }
+}
+
+function normalizeInternalPlannerState(rawState) {
+  const raw = isObject(rawState) ? rawState : {};
+  const coverageQueuesInput = isObject(raw.coverageQueues) ? raw.coverageQueues : {};
+  const sendPairHistoryInput = isObject(raw.sendPairHistory) ? raw.sendPairHistory : {};
+  const reciprocalCooldownsInput = isObject(raw.reciprocalSendCooldowns) ? raw.reciprocalSendCooldowns : {};
+  const validNames = internalPlannerValidAccountNames instanceof Set
+    ? internalPlannerValidAccountNames
+    : new Set();
+
+  const coverageQueues = {};
+  for (const [senderName, entry] of Object.entries(coverageQueuesInput)) {
+    const sender = String(senderName || "").trim();
+    if (!sender || (validNames.size > 0 && !validNames.has(sender))) {
+      continue;
+    }
+
+    const pendingRecipients = Array.isArray(entry && entry.pendingRecipients)
+      ? Array.from(
+          new Set(
+            entry.pendingRecipients
+              .map((recipient) => String(recipient || "").trim())
+              .filter(
+                (recipient) =>
+                  Boolean(recipient) &&
+                  recipient !== sender &&
+                  (validNames.size === 0 || validNames.has(recipient))
+              )
+          )
+        )
+      : [];
+
+    if (pendingRecipients.length === 0) {
+      continue;
+    }
+
+    coverageQueues[sender] = {
+      rosterKey: String(entry && entry.rosterKey ? entry.rosterKey : "").trim(),
+      epoch: Math.max(1, clampToNonNegativeInt(entry && entry.epoch, 1)),
+      pendingRecipients
+    };
+  }
+
+  const normalizedSendPairHistory = {};
+  for (const [pairKey, timestamp] of Object.entries(sendPairHistoryInput)) {
+    const key = String(pairKey || "").trim();
+    const numericTimestamp = Number(timestamp);
+    if (!key || !Number.isFinite(numericTimestamp) || numericTimestamp <= 0) {
+      continue;
+    }
+    normalizedSendPairHistory[key] = numericTimestamp;
+  }
+
+  const normalizedReciprocalCooldowns = {};
+  for (const [pairKey, expiresAt] of Object.entries(reciprocalCooldownsInput)) {
+    const key = String(pairKey || "").trim();
+    const numericExpiresAt = Number(expiresAt);
+    if (!key || !Number.isFinite(numericExpiresAt) || numericExpiresAt <= 0) {
+      continue;
+    }
+    normalizedReciprocalCooldowns[key] = numericExpiresAt;
+  }
+
+  return {
+    version: 1,
+    updatedAt: String(raw.updatedAt || new Date().toISOString()),
+    coverageQueues,
+    sendPairHistory: sortObjectKeys(normalizedSendPairHistory),
+    reciprocalSendCooldowns: sortObjectKeys(normalizedReciprocalCooldowns)
+  };
+}
+
+function exportInternalPlannerState() {
+  const coverageQueues = {};
+  for (const [senderName, entry] of internalCoverageQueues.entries()) {
+    const sender = String(senderName || "").trim();
+    if (!sender) {
+      continue;
+    }
+
+    const pendingRecipients = Array.isArray(entry && entry.pendingRecipients)
+      ? entry.pendingRecipients
+          .map((recipient) => String(recipient || "").trim())
+          .filter((recipient) => Boolean(recipient) && recipient !== sender)
+      : [];
+
+    if (pendingRecipients.length === 0) {
+      continue;
+    }
+
+    coverageQueues[sender] = {
+      rosterKey: String(entry && entry.rosterKey ? entry.rosterKey : "").trim(),
+      epoch: Math.max(1, clampToNonNegativeInt(entry && entry.epoch, 1)),
+      pendingRecipients
+    };
+  }
+
+  const sendPairHistoryState = {};
+  for (const [pairKey, timestamp] of sendPairHistory.entries()) {
+    const key = String(pairKey || "").trim();
+    const numericTimestamp = Number(timestamp);
+    if (!key || !Number.isFinite(numericTimestamp) || numericTimestamp <= 0) {
+      continue;
+    }
+    sendPairHistoryState[key] = numericTimestamp;
+  }
+
+  const reciprocalCooldownsState = {};
+  for (const [pairKey, expiresAt] of reciprocalSendCooldowns.entries()) {
+    const key = String(pairKey || "").trim();
+    const numericExpiresAt = Number(expiresAt);
+    if (!key || !Number.isFinite(numericExpiresAt) || numericExpiresAt <= 0) {
+      continue;
+    }
+    reciprocalCooldownsState[key] = numericExpiresAt;
+  }
+
+  return normalizeInternalPlannerState({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    coverageQueues,
+    sendPairHistory: sendPairHistoryState,
+    reciprocalSendCooldowns: reciprocalCooldownsState
+  });
+}
+
+function applyInternalPlannerState(rawState) {
+  const normalized = normalizeInternalPlannerState(rawState);
+  internalCoverageQueues.clear();
+  sendPairHistory.clear();
+  reciprocalSendCooldowns.clear();
+
+  for (const [senderName, entry] of Object.entries(normalized.coverageQueues)) {
+    internalCoverageQueues.set(senderName, {
+      rosterKey: String(entry && entry.rosterKey ? entry.rosterKey : "").trim(),
+      epoch: Math.max(1, clampToNonNegativeInt(entry && entry.epoch, 1)),
+      pendingRecipients: Array.isArray(entry && entry.pendingRecipients) ? [...entry.pendingRecipients] : []
+    });
+  }
+
+  for (const [pairKey, timestamp] of Object.entries(normalized.sendPairHistory)) {
+    sendPairHistory.set(pairKey, Number(timestamp));
+  }
+
+  for (const [pairKey, expiresAt] of Object.entries(normalized.reciprocalSendCooldowns)) {
+    reciprocalSendCooldowns.set(pairKey, Number(expiresAt));
+  }
+
+  cleanupExpiredSendPairs();
+  return normalized;
+}
+
+function configureInternalPlannerPersistence(statePath, accountsConfig) {
+  internalPlannerStatePath = String(statePath || "").trim();
+  internalPlannerValidAccountNames = new Set(
+    Array.isArray(accountsConfig && accountsConfig.accounts)
+      ? accountsConfig.accounts
+          .map((account) => String(account && account.name ? account.name : "").trim())
+          .filter((name) => Boolean(name))
+      : []
+  );
+}
+
+async function saveInternalPlannerState() {
+  if (!internalPlannerStatePath) {
+    return null;
+  }
+
+  const payload = exportInternalPlannerState();
+  await fs.writeFile(internalPlannerStatePath, JSON.stringify(payload, null, 2), "utf8");
+  return payload;
+}
+
+async function saveInternalPlannerStateSerial() {
+  if (!internalPlannerStatePath) {
+    return null;
+  }
+
+  internalPlannerStateSaveQueue = internalPlannerStateSaveQueue
+    .then(() => saveInternalPlannerState())
+    .catch((error) => {
+      console.warn(
+        `[internal] Failed to save planner state: ${error && error.message ? error.message : String(error)}`
+      );
+      return null;
+    });
+
+  return internalPlannerStateSaveQueue;
+}
+
+function buildInternalRosterKey(sortedAccounts) {
+  return Array.isArray(sortedAccounts)
+    ? sortedAccounts
+        .map((account) => String(account && account.name ? account.name : "").trim())
+        .filter((name) => Boolean(name))
+        .join("||")
+    : "";
+}
+
+function getInternalRecipientOffsetByName(sortedAccounts, senderName, recipientName) {
+  if (!Array.isArray(sortedAccounts) || sortedAccounts.length < 2) {
+    return 1;
+  }
+
+  const senderIndex = sortedAccounts.findIndex((account) => String(account && account.name ? account.name : "").trim() === senderName);
+  const recipientIndex = sortedAccounts.findIndex((account) => String(account && account.name ? account.name : "").trim() === recipientName);
+  if (senderIndex < 0 || recipientIndex < 0 || senderIndex === recipientIndex) {
+    return 1;
+  }
+
+  return (recipientIndex - senderIndex + sortedAccounts.length) % sortedAccounts.length || 1;
+}
+
+function buildInternalCoverageQueue(senderName, sortedAccounts, epoch = 1) {
+  if (!Array.isArray(sortedAccounts) || sortedAccounts.length < 2) {
+    return null;
+  }
+
+  const sender = String(senderName || "").trim();
+  const senderIndex = sortedAccounts.findIndex((account) => String(account && account.name ? account.name : "").trim() === sender);
+  if (senderIndex < 0) {
+    return null;
+  }
+
+  const offsetOrder = shuffleArray(
+    Array.from({ length: Math.max(0, sortedAccounts.length - 1) }, (_, index) => index + 1)
+  );
+  const pendingRecipients = offsetOrder
+    .map((offset) => {
+      const recipient = sortedAccounts[(senderIndex + offset) % sortedAccounts.length];
+      return String(recipient && recipient.name ? recipient.name : "").trim();
+    })
+    .filter((recipientName) => Boolean(recipientName) && recipientName !== sender);
+
+  return {
+    rosterKey: buildInternalRosterKey(sortedAccounts),
+    epoch: Math.max(1, clampToNonNegativeInt(epoch, 1)),
+    pendingRecipients
+  };
+}
+
+function prepareInternalCoverageQueue(senderName, sortedAccounts) {
+  const sender = String(senderName || "").trim();
+  const rosterKey = buildInternalRosterKey(sortedAccounts);
+  const validRecipientNames = new Set(
+    Array.isArray(sortedAccounts)
+      ? sortedAccounts
+          .map((account) => String(account && account.name ? account.name : "").trim())
+          .filter((name) => Boolean(name) && name !== sender)
+      : []
+  );
+
+  const existing = internalCoverageQueues.get(sender);
+  if (
+    existing &&
+    existing.rosterKey === rosterKey &&
+    Array.isArray(existing.pendingRecipients)
+  ) {
+    existing.pendingRecipients = existing.pendingRecipients.filter((recipientName) => validRecipientNames.has(recipientName));
+    if (existing.pendingRecipients.length > 0) {
+      internalCoverageQueues.set(sender, existing);
+      return {
+        entry: existing,
+        restartedEpoch: false,
+        completedEpoch: false
+      };
+    }
+
+    const nextEpoch = Math.max(1, clampToNonNegativeInt(existing.epoch, 1) + 1);
+    const rebuilt = buildInternalCoverageQueue(sender, sortedAccounts, nextEpoch);
+    if (rebuilt) {
+      internalCoverageQueues.set(sender, rebuilt);
+    }
+    return {
+      entry: rebuilt,
+      restartedEpoch: true,
+      completedEpoch: true
+    };
+  }
+
+  const fresh = buildInternalCoverageQueue(sender, sortedAccounts, 1);
+  if (fresh) {
+    internalCoverageQueues.set(sender, fresh);
+  }
+  return {
+    entry: fresh,
+    restartedEpoch: false,
+    completedEpoch: false
+  };
+}
+
+function markInternalCoverageSuccess(senderName, recipientName) {
+  const sender = String(senderName || "").trim();
+  const recipient = String(recipientName || "").trim();
+  if (!sender || !recipient || sender === recipient) {
+    return { removed: false, completedEpoch: false, remainingRecipients: 0, epoch: 0 };
+  }
+
+  const entry = internalCoverageQueues.get(sender);
+  if (!entry || !Array.isArray(entry.pendingRecipients)) {
+    return { removed: false, completedEpoch: false, remainingRecipients: 0, epoch: 0 };
+  }
+
+  const beforeCount = entry.pendingRecipients.length;
+  entry.pendingRecipients = entry.pendingRecipients.filter((candidate) => candidate !== recipient);
+  const removed = entry.pendingRecipients.length !== beforeCount;
+  internalCoverageQueues.set(sender, entry);
+
+  return {
+    removed,
+    completedEpoch: removed && entry.pendingRecipients.length === 0,
+    remainingRecipients: entry.pendingRecipients.length,
+    epoch: Math.max(1, clampToNonNegativeInt(entry.epoch, 1))
+  };
 }
 
 function getReciprocalCooldownSeconds(senderName, recipientName) {
@@ -270,6 +592,16 @@ function recordSendPair(senderName, recipientName) {
 
   sendPairHistory.set(pairKey, nowMs);
   reciprocalSendCooldowns.set(reciprocalKey, nowMs + SEND_PAIR_COOLDOWN_MS);
+
+  const coverageUpdate = markInternalCoverageSuccess(sender, recipient);
+  if (coverageUpdate.removed) {
+    console.log(
+      `[internal] coverage ${sender}: ${recipient} recorded ` +
+      `(${Math.max(0, coverageUpdate.remainingRecipients)} target left in epoch ${coverageUpdate.epoch})`
+    );
+  }
+
+  void saveInternalPlannerStateSerial();
 }
 
 function isReciprocalPairInCooldown(senderName, recipientName) {
@@ -373,7 +705,7 @@ function resetRoundRobinOffset() {
 }
 
 /**
- * Build internal send candidates using rotating offsets + reciprocal cooldown guard.
+ * Build internal send candidates using coverage-first shuffled queues + reciprocal cooldown guard.
  * The first candidate is primary target; remaining entries are fallback recipients.
  */
 function buildInternalSendRequests(
@@ -420,43 +752,97 @@ function buildInternalSendRequests(
   }
 
   cleanupExpiredSendPairs();
-
-  const primaryOffset = getRotatingOffset(sortedAccounts.length, loopRound);
-  const offsetPriority = buildInternalOffsetPriority(sortedAccounts.length, primaryOffset);
   const amount = generateRandomCcAmount(sendPolicy.randomAmount);
-  const requests = [];
+  let requests = [];
   let shortestBlockedCooldownSeconds = 0;
   let skippedByAvoidCount = 0;
+  const coveragePrep = prepareInternalCoverageQueue(senderName, sortedAccounts);
+  const coverageEntry = coveragePrep.entry;
+  if (!coverageEntry || !Array.isArray(coverageEntry.pendingRecipients)) {
+    return {
+      requests: [],
+      reason: "internal-coverage-unavailable",
+      retryAfterSeconds: 0,
+      primaryOffset: 1
+    };
+  }
 
-  for (const offset of offsetPriority) {
-    const recipientIndex = (senderIndex + offset) % sortedAccounts.length;
-    const recipient = sortedAccounts[recipientIndex];
-    if (!recipient || recipient.name === senderName) {
-      continue;
+  if (coveragePrep.restartedEpoch && coveragePrep.completedEpoch) {
+    console.log(
+      `[internal] ${senderName}: full recipient coverage completed, starting shuffled epoch ${coverageEntry.epoch}`
+    );
+  }
+
+  const pendingRecipientQueue = [...coverageEntry.pendingRecipients];
+  const pendingRecipientSet = new Set(pendingRecipientQueue);
+  const coveredRecipientPool = shuffleArray(
+    sortedAccounts
+      .map((account) => String(account && account.name ? account.name : "").trim())
+      .filter((name) => Boolean(name) && name !== senderName && !pendingRecipientSet.has(name))
+  );
+
+  const buildRequest = (recipientName, sourceLabel) => {
+    const recipient = sortedAccounts.find((account) => String(account && account.name ? account.name : "").trim() === recipientName);
+    if (!recipient) {
+      return null;
     }
-
-    if (avoidRecipientsSet.has(recipient.name)) {
-      skippedByAvoidCount += 1;
-      continue;
-    }
-
-    const reciprocalCooldownSeconds = getReciprocalCooldownSeconds(senderName, recipient.name);
-    if (reciprocalCooldownSeconds > 0) {
-      shortestBlockedCooldownSeconds = shortestBlockedCooldownSeconds === 0
-        ? reciprocalCooldownSeconds
-        : Math.min(shortestBlockedCooldownSeconds, reciprocalCooldownSeconds);
-      continue;
-    }
-
-    requests.push({
+    return {
       amount,
       label: recipient.name,
       address: recipient.address,
-      source: "internal-rotating",
-      offset,
-      internalRecipientCandidate: true
-    });
+      source: sourceLabel,
+      offset: getInternalRecipientOffsetByName(sortedAccounts, senderName, recipient.name),
+      internalRecipientCandidate: true,
+      coverageEpoch: coverageEntry.epoch
+    };
+  };
+
+  const collectAvailableRequests = (candidateNames, sourceLabel) => {
+    const phaseRequests = [];
+    for (const recipientName of candidateNames) {
+      if (!recipientName || recipientName === senderName) {
+        continue;
+      }
+
+      if (avoidRecipientsSet.has(recipientName)) {
+        skippedByAvoidCount += 1;
+        continue;
+      }
+
+      const reciprocalCooldownSeconds = getReciprocalCooldownSeconds(senderName, recipientName);
+      if (reciprocalCooldownSeconds > 0) {
+        shortestBlockedCooldownSeconds = shortestBlockedCooldownSeconds === 0
+          ? reciprocalCooldownSeconds
+          : Math.min(shortestBlockedCooldownSeconds, reciprocalCooldownSeconds);
+        continue;
+      }
+
+      const request = buildRequest(recipientName, sourceLabel);
+      if (request) {
+        phaseRequests.push(request);
+      }
+    }
+    return phaseRequests;
+  };
+
+  requests = collectAvailableRequests(pendingRecipientQueue, "internal-coverage");
+  let activePhase = "coverage";
+  if (requests.length === 0 && coveredRecipientPool.length > 0) {
+    requests = collectAvailableRequests(coveredRecipientPool, "internal-coverage-fallback");
+    activePhase = "fallback";
   }
+
+  const primaryOffset =
+    requests.length > 0
+      ? Math.max(1, clampToNonNegativeInt(requests[0].offset, 1))
+      : Math.max(
+          1,
+          getInternalRecipientOffsetByName(
+            sortedAccounts,
+            senderName,
+            pendingRecipientQueue[0] || coveredRecipientPool[0] || senderName
+          )
+        );
 
   if (requests.length === 0) {
     const shortestCooldownSeconds =
@@ -470,9 +856,10 @@ function buildInternalSendRequests(
       : (shortestCooldownSeconds || 0);
     const reason = hasAvoidOnlyBlock
       ? "internal-avoid-sendback"
-      : "internal-reciprocal-cooldown";
+      : (pendingRecipientQueue.length > 0 ? "internal-coverage-cooldown" : "internal-reciprocal-cooldown");
     console.log(
       `[internal] ${senderName}: no eligible recipient. ` +
+      `pending=${pendingRecipientQueue.length}/${Math.max(1, sortedAccounts.length - 1)} ` +
       `cooldownRetry=${shortestCooldownSeconds || 0}s avoidBlocked=${skippedByAvoidCount} ` +
       `(retryAfter=${retryAfterSeconds}s reason=${reason})`
     );
@@ -487,8 +874,9 @@ function buildInternalSendRequests(
   const preview = requests.slice(0, 4).map((entry) => entry.label).join(", ");
   const suffix = requests.length > 4 ? ` (+${requests.length - 4} more)` : "";
   console.log(
-    `[internal] ${senderName}: offset=${primaryOffset} candidates=${requests.length}/${offsetPriority.length} ` +
-    `primary=${requests[0].label} | pool=[${preview}${suffix}]`
+    `[internal] ${senderName}: epoch=${coverageEntry.epoch} remaining=${pendingRecipientQueue.length}/${Math.max(1, sortedAccounts.length - 1)} ` +
+    `phase=${activePhase} primary=${requests[0].label} offset=${primaryOffset} ` +
+    `pool=[${preview}${suffix}]`
   );
 
   return {
@@ -6998,7 +7386,7 @@ async function processAccount(context) {
         });
         console.log(
           `[init] Send plan (hybrid/internal): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-            `${fallbackLabel} | offset=${hybridPlan.primaryOffset}${fallbackSourceLabel}`
+            `${fallbackLabel} | preferred-offset=${hybridPlan.primaryOffset}${fallbackSourceLabel}`
         );
       } else {
         const primaryRequest = sendRequests[0];
@@ -7052,13 +7440,13 @@ async function processAccount(context) {
           send: `Deferred internal send for ${retryAfterSeconds}s`,
           transfer: "deferred (internal-recipient)",
           cooldown: `${retryAfterSeconds}s`,
-          mode: "internal-rotating"
+          mode: "internal-coverage"
         });
 
         return {
           success: true,
           account: account.name,
-          mode: "internal-rotating-deferred",
+          mode: "internal-coverage-deferred",
           deferred: true,
           deferReason,
           deferRetryAfterSeconds: retryAfterSeconds,
@@ -7076,11 +7464,11 @@ async function processAccount(context) {
 
       dashboard.setState({
         send: `${primaryRequest.amount} CC -> ${primaryRequest.label}${fallbackLabel}`,
-        mode: "internal-rotating"
+        mode: "internal-coverage"
       });
       console.log(
-        `[init] Send plan (internal-rotating): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-          `${fallbackLabel} | offset=${internalPlan.primaryOffset}`
+        `[init] Send plan (internal-coverage): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
+          `${fallbackLabel} | preferred-offset=${internalPlan.primaryOffset}`
       );
     } else {
       dashboard.setState({ mode: "balance-only" });
@@ -7801,6 +8189,9 @@ async function runDailyCycle(context) {
   
   // Clean up expired reciprocal cooldown state from previous runs
   cleanupExpiredSendPairs();
+  if (sendMode === "internal" || sendMode === "hybrid") {
+    await saveInternalPlannerStateSerial();
+  }
   
   // Sort accounts for deterministic base order used by rotating offset strategy
   const sortedAccounts = [...accounts.accounts].sort((a, b) => 
@@ -7811,7 +8202,8 @@ async function runDailyCycle(context) {
   console.log(`[cycle] Loop cycle started at ${formatUTCTime(cycleStartTime)}`);
   console.log(`[cycle] Mode: ${sendMode} | Accounts: ${sortedAccounts.length}`);
   if (sendMode === "internal" || sendMode === "hybrid") {
-    console.log(`[internal] Strategy: ADAPTIVE ROTATING OFFSETS + COOLDOWN-AWARE FALLBACK`);
+    console.log(`[internal] Strategy: COVERAGE-FIRST SHUFFLED QUEUES + COOLDOWN-AWARE FALLBACK`);
+    console.log(`[internal] Goal: every sender eventually reaches every internal recipient`);
     console.log(`[internal] Guard: no direct send-back to previous sender for >=10 minutes`);
   }
   if (sendMode === "hybrid") {
@@ -7866,7 +8258,7 @@ async function runDailyCycle(context) {
   const CARRY_OVER_ROUND_DEFER_DEFAULT_SECONDS = 45;
   const carryOverDeferStateByAccount = new Map();
 
-  // Display deterministic account order used as rotating baseline.
+  // Display deterministic account order used as internal roster baseline.
   const ringOrderLabel = sortedAccounts.map((item) => item.name).join(" -> ");
   if (sendMode === "internal" || sendMode === "hybrid") {
     console.log(`[internal] Base account order: ${ringOrderLabel}`);
@@ -8421,11 +8813,13 @@ async function run() {
   const configPath = path.resolve(process.cwd(), args.configFile);
   const accountsPath = path.resolve(process.cwd(), args.accountsFile);
   const tokensPath = path.resolve(process.cwd(), args.tokensFile);
+  const internalPlannerStatePath = path.resolve(process.cwd(), DEFAULT_INTERNAL_PLANNER_STATE_FILE);
 
-  const [rawConfig, rawAccounts, rawTokens] = await Promise.all([
+  const [rawConfig, rawAccounts, rawTokens, rawInternalPlannerState] = await Promise.all([
     readJson(configPath, "config"),
     readJson(accountsPath, "accounts"),
-    readOptionalJson(tokensPath, "tokens")
+    readOptionalJson(tokensPath, "tokens"),
+    readOptionalJson(internalPlannerStatePath, "internal planner state")
   ]);
 
   const syncedRawConfig = await syncWalleyRefundSenderMap(configPath, rawConfig);
@@ -8433,6 +8827,8 @@ async function run() {
   const accounts = normalizeAccounts(rawAccounts);
   const legacyCookies = extractLegacyAccountCookies(rawAccounts);
   const tokens = normalizeTokens(rawTokens, accounts);
+  configureInternalPlannerPersistence(internalPlannerStatePath, accounts);
+  const normalizedInternalPlannerState = applyInternalPlannerState(rawInternalPlannerState);
   const telegramReporter = config.telegram.enabled
     ? new TelegramDashboardReporter({
         ...config.telegram,
@@ -8453,6 +8849,15 @@ async function run() {
 
   // Keep generated token file in sync with current accounts and token schema.
   await saveTokensSerial(tokensPath, tokens);
+
+  if (Object.keys(normalizedInternalPlannerState.coverageQueues || {}).length > 0) {
+    console.log(
+      `[internal] Loaded planner state: ${Object.keys(normalizedInternalPlannerState.coverageQueues).length} sender queue(s) from ${internalPlannerStatePath}`
+    );
+  } else {
+    console.log(`[internal] Planner state ready: ${internalPlannerStatePath}`);
+  }
+  await saveInternalPlannerStateSerial();
 
   // Load recipients
   const recipientsInfo = await loadRecipients(config.recipientFile);

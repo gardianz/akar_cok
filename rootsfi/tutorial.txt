@@ -122,6 +122,8 @@ Setelah npm start, pilih:
 
 2. internal
    - Kirim antar akun dalam accounts.json
+   - Planner coverage-first: bot memprioritaskan recipient internal yang belum pernah dikirim oleh sender itu
+   - Urutan recipient diacak per epoch, jadi tidak monoton tetapi tetap mengejar coverage penuh
    - Wajib: minimal 2 akun punya address valid
 
 3. balance-only
@@ -130,7 +132,7 @@ Setelah npm start, pilih:
 4. hybrid
    - Strategi campuran per round: 2-3 akun kirim external, sisanya internal
    - Akun external tiap round dipilih acak
-   - Akun internal tetap pakai planner internal rotating
+   - Akun internal tetap pakai planner internal coverage-first
    - Akun external pakai recipient random dari recipient.txt
    - Wajib: recipient.txt valid + minimal 2 akun punya address valid
 
@@ -141,6 +143,8 @@ Lalu pilih akun:
 
 Catatan:
 - Untuk mode `internal` dan `hybrid`, bot otomatis memakai semua akun yang punya `address`
+- Planner internal menjaga queue recipient per sender. Target yang belum pernah dikirim akan diprioritaskan dulu sampai semua address pernah saling kirim.
+- Progress planner internal disimpan ke file `internal-planner-state.json`, jadi coverage queue tetap lanjut walau bot restart.
 - Untuk mode `hybrid`, refund Walley hanya diproses untuk TX yang benar-benar external
 - Refund hybrid tidak kembali ke pengirim yang sama; setelah semua akun selesai send di round itu, bot mengurutkan balance RootsFi dari paling kecil ke paling besar lalu mengalokasikan refund mengikuti prioritas tersebut
 - Round baru tidak akan dianggap selesai sebelum refund batch round itu selesai diproses
