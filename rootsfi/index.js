@@ -756,6 +756,7 @@ function buildInternalSendRequests(
   let requests = [];
   let shortestBlockedCooldownSeconds = 0;
   let skippedByAvoidCount = 0;
+  let skippedByQuarantineCount = 0;
   const coveragePrep = prepareInternalCoverageQueue(senderName, sortedAccounts);
   const coverageEntry = coveragePrep.entry;
   if (!coverageEntry || !Array.isArray(coverageEntry.pendingRecipients)) {
@@ -806,6 +807,11 @@ function buildInternalSendRequests(
 
       if (avoidRecipientsSet.has(recipientName)) {
         skippedByAvoidCount += 1;
+        continue;
+      }
+
+      if (isAccountQuarantined(recipientName)) {
+        skippedByQuarantineCount += 1;
         continue;
       }
 
@@ -861,6 +867,7 @@ function buildInternalSendRequests(
       `[internal] ${senderName}: no eligible recipient. ` +
       `pending=${pendingRecipientQueue.length}/${Math.max(1, sortedAccounts.length - 1)} ` +
       `cooldownRetry=${shortestCooldownSeconds || 0}s avoidBlocked=${skippedByAvoidCount} ` +
+      `quarantinedBlocked=${skippedByQuarantineCount} ` +
       `(retryAfter=${retryAfterSeconds}s reason=${reason})`
     );
     return {
@@ -926,6 +933,83 @@ function getPerAccountTxStats(accountName) {
   return perAccountTxStats[accountName] || { total: 0, ok: 0, fail: 0 };
 }
 
+const qualityScoreByAccount = new Map();
+const quarantinedAccounts = new Set();
+
+function parseQualityScoreNumber(rawValue) {
+  const numeric = Number(rawValue);
+  if (Number.isFinite(numeric)) {
+    return Math.max(0, Math.min(100, Math.round(numeric)));
+  }
+
+  const text = String(rawValue || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const match = text.match(/(\d{1,3})\s*\/\s*100/i);
+  if (!match || !match[1]) {
+    return null;
+  }
+
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(parsed)));
+}
+
+function getAccountQualityScore(accountName) {
+  const normalizedName = String(accountName || "").trim();
+  if (!normalizedName || !qualityScoreByAccount.has(normalizedName)) {
+    return null;
+  }
+
+  return qualityScoreByAccount.get(normalizedName);
+}
+
+function isAccountQuarantined(accountName) {
+  const normalizedName = String(accountName || "").trim();
+  return Boolean(normalizedName) && quarantinedAccounts.has(normalizedName);
+}
+
+function updateAccountQualityState(accountName, score, minScoreThreshold, accountLogTag = null) {
+  const normalizedName = String(accountName || "").trim();
+  const numericScore = parseQualityScoreNumber(score);
+  const threshold = Math.max(
+    0,
+    clampToNonNegativeInt(minScoreThreshold, INTERNAL_API_DEFAULTS.safety.minScoreThreshold)
+  );
+
+  if (!normalizedName || numericScore === null) {
+    return null;
+  }
+
+  qualityScoreByAccount.set(normalizedName, numericScore);
+
+  if (numericScore < threshold) {
+    if (!quarantinedAccounts.has(normalizedName)) {
+      quarantinedAccounts.add(normalizedName);
+      console.log(
+        withAccountTag(
+          accountLogTag,
+          `[quarantine] Account '${normalizedName}' quarantined (score ${numericScore} < ${threshold})`
+        )
+      );
+    }
+  } else if (quarantinedAccounts.delete(normalizedName)) {
+    console.log(
+      withAccountTag(
+        accountLogTag,
+        `[quarantine] Account '${normalizedName}' released (score ${numericScore} >= ${threshold})`
+      )
+    );
+  }
+
+  return numericScore;
+}
+
 const INTERNAL_API_DEFAULTS = {
   baseUrl: "https://bridge.rootsfi.com",
   paths: {
@@ -944,6 +1028,7 @@ const INTERNAL_API_DEFAULTS = {
     sendTransfer: "/api/send/transfer",
     sendHistory: "/api/send/history",
     walletCcOutgoing: "/api/wallet/cc-outgoing",
+    recipientPreview: "/api/send/recipient-preview",
     rewardsOverview: "/api/rewards",
     rewardsLottery: "/api/rewards/lottery",
     rewardsSendLoyaltyDailyTaper: "/api/rewards/send-loyalty-daily-taper"
@@ -1010,6 +1095,10 @@ const INTERNAL_API_DEFAULTS = {
     parallelJitterMinSeconds: 1,
     parallelJitterMaxSeconds: 10,
     senderMap: {}
+  },
+  safety: {
+    minScoreThreshold: 30,
+    minHoldBalanceCc: 10
   }
 };
 
@@ -2640,7 +2729,8 @@ function cloneRuntimeConfig(config) {
         ...(isObject(config.send && config.send.randomAmount) ? config.send.randomAmount : {})
       }
     },
-    ui: { ...config.ui }
+    ui: { ...config.ui },
+    safety: { ...(isObject(config.safety) ? config.safety : {}) }
   };
 }
 
@@ -3013,7 +3103,7 @@ function selectHybridRefundTarget(sourceAccount, selectedAccounts, accountSnapsh
         .filter((account) => {
           const name = String(account && account.name ? account.name : "").trim();
           const address = String(account && account.address ? account.address : "").trim();
-          return Boolean(name) && Boolean(address) && name !== sourceName;
+          return Boolean(name) && Boolean(address) && name !== sourceName && !isAccountQuarantined(name);
         })
         .map((account) => {
           const name = String(account.name || "").trim();
@@ -3054,7 +3144,11 @@ function selectHybridRefundTarget(sourceAccount, selectedAccounts, accountSnapsh
 function buildRoundRefundPriorityTargets(selectedAccounts, accountSnapshots) {
   const candidates = Array.isArray(selectedAccounts)
     ? selectedAccounts
-        .filter((account) => String(account && account.address ? account.address : "").trim())
+        .filter((account) => {
+          const name = String(account && account.name ? account.name : "").trim();
+          const address = String(account && account.address ? account.address : "").trim();
+          return Boolean(address) && !isAccountQuarantined(name);
+        })
         .map((account) => {
           const name = String(account && account.name ? account.name : "").trim();
           const snapshot = isObject(accountSnapshots) && isObject(accountSnapshots[name])
@@ -3896,6 +3990,18 @@ function normalizeConfig(rawConfig) {
     randomAmount
   };
 
+  const safetyInput = isObject(rawConfig.safety) ? rawConfig.safety : {};
+  const safety = {
+    minScoreThreshold: clampToNonNegativeInt(
+      safetyInput.minScoreThreshold,
+      INTERNAL_API_DEFAULTS.safety.minScoreThreshold
+    ),
+    minHoldBalanceCc: clampToNonNegativeInt(
+      safetyInput.minHoldBalanceCc,
+      INTERNAL_API_DEFAULTS.safety.minHoldBalanceCc
+    )
+  };
+
   return {
     baseUrl: INTERNAL_API_DEFAULTS.baseUrl,
     paths: { ...INTERNAL_API_DEFAULTS.paths },
@@ -3911,7 +4017,8 @@ function normalizeConfig(rawConfig) {
     send,
     ui,
     telegram,
-    walleyRefund
+    walleyRefund,
+    safety
   };
 }
 
@@ -4812,6 +4919,13 @@ class RootsFiApiClient {
     });
   }
 
+  async recipientPreview(partyId) {
+    return this.requestJson("POST", this.paths.recipientPreview, {
+      refererPath: this.paths.send,
+      body: { partyId }
+    });
+  }
+
   async sendCcTransfer(recipient, amount, idempotencyKey) {
     return this.requestJson("POST", this.paths.sendTransfer, {
       refererPath: this.paths.send,
@@ -4821,6 +4935,23 @@ class RootsFiApiClient {
       body: {
         recipientType: "canton_wallet",
         recipient,
+        amount,
+        idempotencyKey,
+        preferredNetwork: "canton",
+        tokenType: "CC",
+        instrumentId: "Amulet"
+      }
+    });
+  }
+
+  async sendCcTransferByUsername(username, amount, idempotencyKey) {
+    return this.requestJson("POST", this.paths.sendTransfer, {
+      refererPath: this.paths.send,
+      timeoutMs: 60000,
+      skipInfiniteTimeoutRetry: true,
+      body: {
+        recipientType: "user",
+        recipient: username,
         amount,
         idempotencyKey,
         preferredNetwork: "canton",
@@ -5267,17 +5398,32 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
     `[info] Cooldown passed (retryAfterSeconds=${cooldownData.retryAfterSeconds ?? 0}, cooldownMinutes=${cooldownData.cooldownMinutes ?? "n/a"})`
   );
 
-  // Step 2: Resolve recipient (skip for external wallets, no retry needed)
+  // Step 2a: Recipient preview (matches browser flow, non-critical)
+  stepLog("[step] Recipient preview");
+  try {
+    await apiCallWithTimeout(
+      () => client.recipientPreview(sendRequest.address),
+      "Recipient preview",
+      10000
+    );
+  } catch (error) {
+    console.log(`[warn] Recipient preview failed (non-critical): ${error.message}`);
+  }
+
+  // Step 2b: Resolve recipient and prefer username route when available
   stepLog("[step] Resolve recipient");
+  let resolvedUsername = null;
   try {
     const resolveResponse = await apiCallWithTimeout(
       () => client.resolveSendRecipient(sendRequest.address),
       "Resolve recipient",
-      15000 // 15s timeout
+      15000
     );
     const resolveData = isObject(resolveResponse.data) ? resolveResponse.data : {};
-    const preview = JSON.stringify(resolveData).slice(0, 180);
-    console.log(`[info] Resolve response: ${preview || "ok"}`);
+    resolvedUsername = String(resolveData.username || "").trim() || null;
+    console.log(
+      `[info] Resolved: username=${resolvedUsername || "n/a"} route=${resolveData.route || "n/a"}`
+    );
   } catch (error) {
     const message = String(error && error.message ? error.message : "");
     if (message.includes("No Roots user is linked to this Canton address")) {
@@ -5314,7 +5460,11 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   let transferResponse = null;
   try {
     transferResponse = await apiCallWithRetry(
-      () => client.sendCcTransfer(sendRequest.address, sendRequest.amount, idempotencyKey),
+      () => (
+        resolvedUsername
+          ? client.sendCcTransferByUsername(resolvedUsername, sendRequest.amount, idempotencyKey)
+          : client.sendCcTransfer(sendRequest.address, sendRequest.amount, idempotencyKey)
+      ),
       "Transfer CC",
       API_CALL_MAX_RETRIES,
       75000,
@@ -5572,11 +5722,14 @@ function extractRewardsInsightsFromHtml(html) {
   return { quality: quality || "-", tier: tier || "-" };
 }
 
-function buildRewardsSummaryLabel(rewardLabel, qualityLabel, tierLabel) {
+function buildRewardsSummaryLabel(rewardLabel, qualityLabel, tierLabel, todayPointsLabel = "-", volumeLabel = "-", dailyCheckinLabel = "-") {
   const parts = [];
   const reward = String(rewardLabel || "-").trim();
   const quality = String(qualityLabel || "-").trim();
   const tier = String(tierLabel || "-").trim();
+  const todayPoints = String(todayPointsLabel || "-").trim();
+  const volume = String(volumeLabel || "-").trim();
+  const dailyCheckin = String(dailyCheckinLabel || "-").trim();
 
   if (reward && reward !== "-") {
     parts.push(reward);
@@ -5586,6 +5739,15 @@ function buildRewardsSummaryLabel(rewardLabel, qualityLabel, tierLabel) {
   }
   if (tier && tier !== "-") {
     parts.push(`Tier ${tier}`);
+  }
+  if (todayPoints && todayPoints !== "-") {
+    parts.push(`Today ${todayPoints}`);
+  }
+  if (volume && volume !== "-") {
+    parts.push(`Vol ${volume}`);
+  }
+  if (dailyCheckin && dailyCheckin !== "-") {
+    parts.push(`Check-in ${dailyCheckin}`);
   }
 
   return parts.length > 0 ? parts.join(" | ") : "-";
@@ -5692,6 +5854,7 @@ function extractRewardsInsightsFromResponse(payload) {
   let todayPoints = "-";
   let volume = "-";
   let dailyCheckin = "-";
+  let score = null;
 
   const qualityCandidates = [
     weeklyQuality.score,
@@ -5707,6 +5870,7 @@ function extractRewardsInsightsFromResponse(payload) {
     const label = formatRewardsQualityLabel(candidate);
     if (label !== "-") {
       quality = label;
+      score = parseQualityScoreNumber(candidate);
       break;
     }
   }
@@ -5760,15 +5924,16 @@ function extractRewardsInsightsFromResponse(payload) {
     dailyCheckin = formatRewardsDailyCheckinLabel(data.streakDays, Boolean(data.checkedIn));
   }
 
-  return { quality, tier, todayPoints, volume, dailyCheckin };
+  return { quality, tier, todayPoints, volume, dailyCheckin, score };
 }
 
-async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag = null) {
+async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag = null, accountName = null, minScoreThreshold = null) {
   let qualityLabel = "-";
   let tierLabel = "-";
   let todayPointsLabel = "-";
   let volumeLabel = "-";
   let dailyCheckinLabel = "-";
+  let qualityScore = null;
 
   try {
     const overviewResponse = await client.getRewardsOverview();
@@ -5778,6 +5943,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
     todayPointsLabel = insights.todayPoints;
     volumeLabel = insights.volume;
     dailyCheckinLabel = insights.dailyCheckin;
+    qualityScore = parseQualityScoreNumber(insights.score);
   } catch (error) {
     if (!isTimeoutError(error) && !isCheckpointOr429Error(error)) {
       console.log(withAccountTag(accountLogTag, `[warn] Rewards overview endpoint failed: ${error.message}`));
@@ -5794,11 +5960,22 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
       if (tierLabel === "-") {
         tierLabel = String(rewardsInsights.tier || "-").trim() || "-";
       }
+      if (qualityScore === null && qualityLabel !== "-") {
+        qualityScore = parseQualityScoreNumber(qualityLabel);
+      }
     } catch (error) {
       if (!isTimeoutError(error) && !isCheckpointOr429Error(error)) {
         console.log(withAccountTag(accountLogTag, `[warn] Rewards page scrape failed: ${error.message}`));
       }
     }
+  }
+
+  if (qualityScore === null && qualityLabel !== "-") {
+    qualityScore = parseQualityScoreNumber(qualityLabel);
+  }
+
+  if (accountName && qualityScore !== null) {
+    updateAccountQualityState(accountName, qualityScore, minScoreThreshold, accountLogTag);
   }
 
   if (
@@ -5809,6 +5986,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
     dailyCheckinLabel !== "-"
   ) {
     const summaryLabel = buildRewardsSummaryLabel(
+      "-",
       qualityLabel,
       tierLabel,
       todayPointsLabel,
@@ -5826,6 +6004,14 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
     console.log(withAccountTag(accountLogTag, `[info] Rewards stats: ${summaryLabel}`));
   }
   // Don't log warning for timeout - just silently skip
+  return {
+    quality: qualityLabel,
+    tier: tierLabel,
+    todayPoints: todayPointsLabel,
+    volume: volumeLabel,
+    dailyCheckin: dailyCheckinLabel,
+    score: qualityScore
+  };
 }
 
 async function executeSendBatch(client, sendRequests, config, dashboard, onCheckpointRefresh, accountLogTag = null, senderAccountName = null) {
@@ -5869,7 +6055,14 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
   const MAX_SEND_FLOW_RETRY_ATTEMPTS = 4;
   const BALANCE_GUARD_RETRY_DELAY_MS = 2000;
   const BALANCE_GUARD_RETRY_TIMEOUT_MS = BALANCE_CHECK_TIMEOUT_MS + 5000;
-  const BALANCE_GUARD_MIN_BUFFER_CC = 0.001;
+  const BALANCE_GUARD_MIN_BUFFER_CC = Math.max(
+    0,
+    Number(
+      isObject(config && config.safety)
+        ? config.safety.minHoldBalanceCc
+        : INTERNAL_API_DEFAULTS.safety.minHoldBalanceCc
+    ) || 0
+  );
   const recipientCandidateMode = sendRequests.every(
     (entry) => isObject(entry) && entry.internalRecipientCandidate === true
   );
@@ -7229,6 +7422,13 @@ async function processAccount(context) {
   const cooldownLabel = defaultMaxCooldownSeconds > defaultMinCooldownSeconds
     ? `${defaultMinCooldownSeconds}-${defaultMaxCooldownSeconds}s`
     : `${defaultMinCooldownSeconds}s`;
+  const minScoreThreshold = Math.max(
+    0,
+    clampToNonNegativeInt(
+      isObject(accountConfig.safety) ? accountConfig.safety.minScoreThreshold : null,
+      INTERNAL_API_DEFAULTS.safety.minScoreThreshold
+    )
+  );
 
   // Apply token profile to config for this account
   applyTokenProfileToConfig(accountConfig, accountToken);
@@ -7710,7 +7910,13 @@ async function processAccount(context) {
           balance: `CC=${balance.cc} | USDCx=${balance.usdcx} | CBTC=${balance.cbtc}`
         });
 
-        await refreshThisWeekRewardDashboard(client, dashboard, accountLogTag);
+        await refreshThisWeekRewardDashboard(
+          client,
+          dashboard,
+          accountLogTag,
+          account.name,
+          minScoreThreshold
+        );
 
         let sendBatchResult = {
           completedTx: 0,
@@ -7721,7 +7927,19 @@ async function processAccount(context) {
           completedTransfers: []
         };
 
-        if (sendRequests.length > 0) {
+        const qualityScore1 = getAccountQualityScore(account.name);
+        if (sendRequests.length > 0 && qualityScore1 !== null && qualityScore1 < minScoreThreshold) {
+          dashboard.setState({
+            transfer: `skipped (score ${qualityScore1}/100)`,
+            send: `Skip send: quality ${qualityScore1}/100 < threshold ${minScoreThreshold}`
+          });
+          console.log(
+            withAccountTag(
+              accountLogTag,
+              `[SKIP] Account quarantined (score ${qualityScore1} < ${minScoreThreshold}) - skipping send`
+            )
+          );
+        } else if (sendRequests.length > 0) {
           sendBatchResult = await executeSendBatch(
             client,
             sendRequests,
@@ -8027,7 +8245,13 @@ async function processAccount(context) {
       balance: `CC=${balance.cc} | USDCx=${balance.usdcx} | CBTC=${balance.cbtc}`
     });
 
-    await refreshThisWeekRewardDashboard(client, dashboard, accountLogTag);
+    await refreshThisWeekRewardDashboard(
+      client,
+      dashboard,
+      accountLogTag,
+      account.name,
+      minScoreThreshold
+    );
 
     let sendBatchResult = {
       completedTx: 0,
@@ -8038,7 +8262,19 @@ async function processAccount(context) {
       completedTransfers: []
     };
 
-    if (sendRequests.length > 0) {
+    const qualityScore2 = getAccountQualityScore(account.name);
+    if (sendRequests.length > 0 && qualityScore2 !== null && qualityScore2 < minScoreThreshold) {
+      dashboard.setState({
+        transfer: `skipped (score ${qualityScore2}/100)`,
+        send: `Skip send: quality ${qualityScore2}/100 < threshold ${minScoreThreshold}`
+      });
+      console.log(
+        withAccountTag(
+          accountLogTag,
+          `[SKIP] Account quarantined (score ${qualityScore2} < ${minScoreThreshold}) - skipping send`
+        )
+      );
+    } else if (sendRequests.length > 0) {
       sendBatchResult = await executeSendBatch(
         client,
         sendRequests,
@@ -8857,6 +9093,9 @@ async function run() {
   } else {
     console.log(`[internal] Planner state ready: ${internalPlannerStatePath}`);
   }
+  console.log(
+    `[init] Safety: minScoreThreshold=${config.safety.minScoreThreshold}, minHoldBalanceCc=${config.safety.minHoldBalanceCc}`
+  );
   await saveInternalPlannerStateSerial();
 
   // Load recipients

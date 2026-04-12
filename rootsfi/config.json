@@ -29,6 +29,10 @@
     "dashboard": true,
     "logLines": 20
   },
+  "safety": {
+    "minScoreThreshold": 40,
+    "minHoldBalanceCc": 200
+  },
   "telegram": {
     "enabled": false,
     "botToken": "YOUR_TELEGRAM_BOT_TOKEN",

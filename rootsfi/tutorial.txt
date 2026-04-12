@@ -272,3 +272,9 @@ Catatan:
 - Refund hanya dijalankan untuk mode `external`
 - Nominal refund mengikuti nominal transfer RootsFi yang sukses
 - Jika refund Walley gagal, transfer RootsFi yang sudah sukses tidak di-revert; kegagalannya hanya dicatat di log
+
+Setting safety:
+- `safety.minScoreThreshold`
+  Jika quality score akun di bawah angka ini, akun akan di-quarantine dan bot skip proses send untuk akun tersebut sampai score pulih.
+- `safety.minHoldBalanceCc`
+  Jumlah saldo CC yang selalu ditahan dan tidak ikut dipakai untuk tx. Ini dipakai sebagai hold balance / reserve.
