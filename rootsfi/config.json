@@ -1,0 +1,61 @@
+{
+  "send": {
+    "maxLoopTx": 100,
+    "minDelayTxSeconds": 300,
+    "maxDelayTxSeconds": 1200,
+    "parallelJitterMinSeconds": 1,
+    "parallelJitterMaxSeconds": 10,
+    "delayCycleSeconds": 3000,
+    "sequentialAllRounds": true,
+    "randomAmount": {
+      "enabled": true,
+      "min": "30",
+      "max": "100",
+      "decimals": 2
+    }
+  },
+  "recipientFile": "recipient.txt",
+  "session": {
+    "proactiveVercelRefreshMinutes": 0,
+    "browserChallengeRetryAfterSeconds": 120,
+    "maxSessionReuseTransientAttempts": 3,
+    "maxSessionReuseTransientBrowserRefreshes": 2,
+    "transientBrowserRefreshTriggerFailures": 1,
+    "sessionReuseTransientRetryAfterSeconds": 30,
+    "maxConcurrentSessionReuse": 1,
+    "sessionReuseRetryJitterSeconds": 8
+  },
+  "ui": {
+    "dashboard": true,
+    "logLines": 20
+  },
+  "telegram": {
+    "enabled": false,
+    "botToken": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chatId": "YOUR_TELEGRAM_CHAT_ID",
+    "messageThreadId": "",
+    "updateIntervalSeconds": 15,
+    "logsPerUpdate": 8,
+    "accountsPerUpdate": 10,
+    "sendCycleSummary": true
+  },
+  "walleyRefund": {
+    "enabled": true,
+    "projectDir": "../walley",
+    "tokenSymbol": "CC",
+    "reasonPrefix": "rootsfi-refund",
+    "autoSyncSenderMap": true,
+    "parallelEnabled": false,
+    "maxConcurrency": 3,
+    "parallelJitterMinSeconds": 1,
+    "parallelJitterMaxSeconds": 10,
+    "senderMap": {
+      "walley-ani": "walley-2",
+      "walley-ani::1220fab96ee2ed7409191a291fd84012be5f96e08ac9ca5df1208352fa9ea7c7884e": "walley-2",
+      "walley-ervan": "walley-distributor",
+      "walley-ervan::12207b150588522a25f5de126863b874d0243a3e63046b1f9944ed70a2e8c0939eea": "walley-distributor",
+      "walley-gosjavar": "walley-1",
+      "walley-gosjavar::12207195241ab2e51c9d23df8a1ec275a2f9409e86f716ea24c921c52b23c0d5a0e6": "walley-1"
+    }
+  }
+}

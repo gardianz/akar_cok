@@ -1,0 +1,15 @@
+{
+  "name": "walley-transfer-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Walley transfer bot with browser-session automation",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0",
+    "@scure/bip39": "^1.4.0"
+  }
+}

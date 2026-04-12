@@ -1,0 +1,15 @@
+{
+  "defaultAccount": "Account 1",
+  "accounts": [
+    {
+      "name": "Account 1",
+      "email": "account1@example.com",
+      "address": "roots-account-1::1220exampleaddress000000000000000000000000000000000000000000000001"
+    },
+    {
+      "name": "Account 2",
+      "email": "account2@example.com",
+      "address": "roots-account-2::1220exampleaddress000000000000000000000000000000000000000000000002"
+    }
+  ]
+}

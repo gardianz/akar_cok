@@ -1,0 +1,9 @@
+[
+  {
+    "from": "walley-1",
+    "toPartyId": "walley-bob::1220........................................................",
+    "amount": "1.25",
+    "tokenSymbol": "CC",
+    "reason": "root-wallet-seed"
+  }
+]

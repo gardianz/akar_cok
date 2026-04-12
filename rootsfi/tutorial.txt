@@ -1,0 +1,270 @@
+TUTORIAL SINGKAT ROOTSFI BOT (UNTUK PEMULA)
+
+Tujuan:
+Menjalankan bot untuk cek balance atau kirim CC secara otomatis dengan beberapa akun.
+
+==================================================
+1) PERSIAPAN (WAJIB)
+==================================================
+- Install Node.js versi 18 atau lebih baru.
+- Pastikan email tiap akun bisa dibuka (untuk OTP).
+- Buka terminal di folder project ini.
+
+Perintah awal:
+1. npm install
+2. npm start
+
+Catatan:
+- Bot akan meminta pilihan mode di terminal.
+- Bot berjalan terus (loop harian) sampai dihentikan manual.
+
+==================================================
+2) ISI FILE YANG DIPAKAI BOT
+==================================================
+A. accounts.json
+Wajib berisi array accounts.
+- name: nama akun (unik)
+- email: email valid
+- address: isi untuk mode internal (boleh kosong jika hanya external/balance)
+
+Contoh:
+{
+  "defaultAccount": "Account 1",
+  "accounts": [
+    {
+      "name": "Account 1",
+      "email": "email1@gmail.com",
+      "address": "alias1::1220abcd..."
+    },
+    {
+      "name": "Account 2",
+      "email": "email2@gmail.com",
+      "address": "alias2::1220efgh..."
+    }
+  ]
+}
+
+B. config.json
+Field penting:
+- send.maxLoopTx: jumlah TX per akun per round
+- send.minDelayTxSeconds / send.maxDelayTxSeconds: jeda TX normal / cooldown akun
+- send.parallelJitterMinSeconds / send.parallelJitterMaxSeconds: jeda acak start akun saat mode parallel aktif
+- send.sequentialAllRounds: `false` = round 1 tetap sequential, round berikutnya parallel
+- send.delayCycleSeconds: jeda antar round
+- send.randomAmount.enabled/min/max/decimals: nominal random
+- recipientFile: nama file tujuan external (default recipient.txt)
+- telegram.enabled/botToken/chatId: kirim dashboard live ke Telegram bot
+- walleyRefund.enabled: refund otomatis dari wallet Walley kembali ke wallet RootsFi asal
+- walleyRefund.parallelEnabled: `false` = refund satu per satu, `true` = refund bisa paralel
+- walleyRefund.maxConcurrency: jumlah maksimal refund paralel saat `parallelEnabled=true`
+- walleyRefund.parallelJitterMinSeconds / walleyRefund.parallelJitterMaxSeconds: jitter refund paralel
+
+Contoh aman untuk mulai:
+{
+  "send": {
+    "maxLoopTx": 1,
+    "minDelayTxSeconds": 120,
+    "maxDelayTxSeconds": 180,
+    "parallelJitterMinSeconds": 1,
+    "parallelJitterMaxSeconds": 10,
+    "sequentialAllRounds": false,
+    "delayCycleSeconds": 300,
+    "randomAmount": {
+      "enabled": true,
+      "min": "1",
+      "max": "2",
+      "decimals": 1
+    }
+  },
+  "recipientFile": "recipient.txt",
+  "ui": {
+    "dashboard": true,
+    "logLines": 5
+  },
+  "telegram": {
+    "enabled": false,
+    "botToken": "",
+    "chatId": "",
+    "messageThreadId": "",
+    "updateIntervalSeconds": 15,
+    "logsPerUpdate": 8,
+    "accountsPerUpdate": 10,
+    "sendCycleSummary": true
+  },
+  "walleyRefund": {
+    "enabled": false,
+    "projectDir": "../walley",
+    "tokenSymbol": "CC",
+    "reasonPrefix": "rootsfi-refund",
+    "parallelEnabled": false,
+    "maxConcurrency": 3,
+    "parallelJitterMinSeconds": 1,
+    "parallelJitterMaxSeconds": 10,
+    "senderMap": {}
+  }
+}
+
+C. recipient.txt (khusus mode external)
+Format tiap baris:
+alias::1220....
+
+Contoh:
+userA::1220abcd1234...
+userB::1220efgh5678...
+
+==================================================
+3) PILIH MODE SAAT BOT BERJALAN
+==================================================
+Setelah npm start, pilih:
+1. external
+   - Kirim ke alamat random dari recipient.txt
+   - Wajib: recipient.txt valid + randomAmount.enabled=true
+
+2. internal
+   - Kirim antar akun dalam accounts.json
+   - Wajib: minimal 2 akun punya address valid
+
+3. balance-only
+   - Hanya cek balance, tanpa kirim
+
+4. hybrid
+   - Strategi campuran per round: 2-3 akun kirim external, sisanya internal
+   - Akun external tiap round dipilih acak
+   - Akun internal tetap pakai planner internal rotating
+   - Akun external pakai recipient random dari recipient.txt
+   - Wajib: recipient.txt valid + minimal 2 akun punya address valid
+
+Lalu pilih akun:
+- 0 = semua akun
+- 1 = akun nomor 1
+- 1,3 = multi akun tertentu
+
+Catatan:
+- Untuk mode `internal` dan `hybrid`, bot otomatis memakai semua akun yang punya `address`
+- Untuk mode `hybrid`, refund Walley hanya diproses untuk TX yang benar-benar external
+- Refund hybrid tidak kembali ke pengirim yang sama; setelah semua akun selesai send di round itu, bot mengurutkan balance RootsFi dari paling kecil ke paling besar lalu mengalokasikan refund mengikuti prioritas tersebut
+- Round baru tidak akan dianggap selesai sebelum refund batch round itu selesai diproses
+- Refund round-level bisa berjalan paralel dengan jitter, tetapi tetap berurutan untuk transfer yang memakai sender Walley yang sama
+- Bila `send.sequentialAllRounds=false`, round 1 dipakai untuk bangun session/OTP lalu round berikutnya jalan parallel dengan jitter acak antar akun
+
+==================================================
+4) OTP DAN SESSION
+==================================================
+- Jika session belum valid, bot kirim OTP ke email akun.
+- Masukkan OTP angka (4-8 digit) di terminal.
+- Setelah berhasil, session disimpan otomatis ke tokens.json.
+- Run berikutnya biasanya lebih cepat karena mencoba pakai session lama dulu.
+
+==================================================
+5) CARA STOP BOT
+==================================================
+- Tekan Ctrl+C di terminal.
+
+==================================================
+6) ERROR UMUM (SINGKAT)
+==================================================
+- "External mode requires recipient.txt": isi recipient.txt dengan format alias::1220...
+- "Internal mode requires at least 2 accounts with address": isi address minimal 2 akun
+- "Invalid JSON": cek koma/kurung di accounts.json atau config.json
+- OTP gagal/expired: jalankan lagi, tunggu OTP baru
+
+==================================================
+7) TIPS AMAN
+==================================================
+- Jangan bagikan file tokens.json (berisi session/cookie).
+- Simpan nominal kecil dulu saat test.
+- Cek log dashboard untuk status tiap akun sebelum dinaikkan scale-nya.
+
+==================================================
+8) MONITORING KE TELEGRAM BOT (OPSIONAL)
+==================================================
+Bot utama sekarang bisa mengirim snapshot dashboard + log terbaru ke Telegram.
+
+Cara pakai via config.json:
+- Isi `telegram.enabled` = true
+- Isi `telegram.botToken` dari BotFather
+- Isi `telegram.chatId` tujuan kirim log
+- Isi `telegram.messageThreadId` jika pakai forum topic Telegram, kalau tidak biarkan kosong
+
+Contoh:
+{
+  "telegram": {
+    "enabled": true,
+    "botToken": "123456:ABCDEF",
+    "chatId": "-1001234567890",
+    "messageThreadId": "",
+    "updateIntervalSeconds": 15,
+    "logsPerUpdate": 8,
+    "accountsPerUpdate": 10,
+    "sendCycleSummary": true
+  }
+}
+
+Alternatif via environment variable:
+- `ROOTSFI_TELEGRAM_ENABLED=1`
+- `ROOTSFI_TELEGRAM_BOT_TOKEN=...`
+- `ROOTSFI_TELEGRAM_CHAT_ID=...`
+- `ROOTSFI_TELEGRAM_THREAD_ID=...`
+
+Catatan:
+- Bot akan meng-edit 1 pesan status utama secara berkala agar tidak spam.
+- Saat cycle selesai/gagal, bot juga bisa kirim ringkasan event terpisah.
+- Pastikan bot Telegram sudah ditambahkan ke grup/channel tujuan dan punya izin kirim pesan.
+
+==================================================
+9) INTEGRASI REFUND WALLEY -> ROOTSFI
+==================================================
+Bot RootsFi sekarang bisa memicu refund otomatis dari bot Walley setelah transfer external sukses.
+
+Flow:
+- RootsFi kirim: `R1 -> W2`
+- Setelah sukses, bot panggil proyek Walley
+- Walley kirim balik jumlah sama: `W2 -> R1`
+
+Syarat penting:
+- `rootsfi/accounts.json` harus punya field `address` untuk tiap akun RootsFi
+- folder proyek Walley harus ada di path yang sesuai (`../walley` dari folder RootsFi)
+- recipient external di RootsFi harus mewakili wallet Walley
+
+Konfigurasi:
+{
+  "walleyRefund": {
+    "enabled": true,
+    "projectDir": "../walley",
+    "tokenSymbol": "CC",
+    "reasonPrefix": "rootsfi-refund",
+    "autoSyncSenderMap": true,
+    "parallelEnabled": false,
+    "maxConcurrency": 3,
+    "parallelJitterMinSeconds": 1,
+    "parallelJitterMaxSeconds": 10,
+    "senderMap": {
+      "walley-gosjavar": "walley-1",
+      "walley-ani": "walley-2"
+    }
+  }
+}
+
+Cara baca setting refund paralel:
+- `parallelEnabled: false`
+  Refund dijalankan satu per satu. Ini paling mudah dipantau dan paling aman kalau Anda ingin stabil.
+- `parallelEnabled: true`
+  Refund bisa jalan paralel.
+- `maxConcurrency`
+  Batas maksimal refund yang boleh berjalan bersamaan.
+- `parallelJitterMinSeconds` / `parallelJitterMaxSeconds`
+  Jeda acak sebelum refund paralel dimulai agar tidak menabrak dalam detik yang sama.
+
+Cara kerja mapping sender:
+- Secara default bot mencoba mencocokkan recipient RootsFi ke akun Walley memakai alias atau party id
+- Jika `autoSyncSenderMap: true`, bot akan membaca `../walley/accounts.json` saat startup lalu menulis ulang `config.json` agar `senderMap` selalu mengikuti akun Walley yang tersedia
+- Alias yang cocok dengan `partyHint` akun Walley akan dipetakan otomatis
+- Jika alias di `recipient.txt` cocok dengan akun Walley, full `partyId` recipient juga ikut dimasukkan otomatis ke `senderMap`
+- Jika alias di `recipient.txt` tidak sama dengan `name` / `partyHint` akun Walley, isi `senderMap`
+- `senderMap` key bisa alias recipient atau full party id Walley
+- `senderMap` value diisi `name` atau `partyHint` akun Walley yang benar
+
+Catatan:
+- Refund hanya dijalankan untuk mode `external`
+- Nominal refund mengikuti nominal transfer RootsFi yang sukses
+- Jika refund Walley gagal, transfer RootsFi yang sudah sukses tidak di-revert; kegagalannya hanya dicatat di log

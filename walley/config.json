@@ -1,0 +1,14 @@
+{
+  "sessionMode": "browser-session",
+  "transferMode": "manual",
+  "browserChannel": "chrome",
+  "browserHeadless": true,
+  "loginConcurrency": 1,
+  "autoAcceptPendingTransfers": true,
+  "pendingTransferPollIntervalMs": 4000,
+  "pendingTransferPollAttempts": 6,
+  "postAcceptTransferDelayMinMs": 3000,
+  "postAcceptTransferDelayMaxMs": 8000,
+  "bootstrapMissingSession": true,
+  "keepBrowserOpen": false
+}
