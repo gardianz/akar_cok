@@ -1172,6 +1172,7 @@ class TelegramDashboardReporter {
     this.sendCycleSummary = Boolean(options.sendCycleSummary);
     this.projectName = String(options.projectName || "RootsFi Bot").trim() || "RootsFi Bot";
     this.pendingText = "";
+    this.pendingIsHtml = false;
     this.lastSentText = "";
     this.lastSentAt = 0;
     this.statusMessageId = null;
@@ -1194,6 +1195,22 @@ class TelegramDashboardReporter {
     const payload = {
       chat_id: this.chatId,
       text: `<b>${escapeHtml(this.projectName)}</b>\n<pre>${escapeHtml(truncatedText)}</pre>`,
+      parse_mode: "HTML",
+      disable_web_page_preview: true
+    };
+
+    if (this.messageThreadId) {
+      payload.message_thread_id = this.messageThreadId;
+    }
+
+    return payload;
+  }
+
+  buildHtmlPayload(html) {
+    const safeHtml = String(html || "").trim();
+    const payload = {
+      chat_id: this.chatId,
+      text: safeHtml,
       parse_mode: "HTML",
       disable_web_page_preview: true
     };
@@ -1259,8 +1276,10 @@ class TelegramDashboardReporter {
     }
 
     this.pendingText = "";
+    const isHtml = Boolean(this.pendingIsHtml);
+    this.pendingIsHtml = false;
     return this.enqueue(async () => {
-      const payload = this.buildPayload(text);
+      const payload = isHtml ? this.buildHtmlPayload(text) : this.buildPayload(text);
 
       if (this.statusMessageId) {
         try {
@@ -1304,6 +1323,7 @@ class TelegramDashboardReporter {
     }
 
     this.pendingText = safeText;
+    this.pendingIsHtml = Boolean(options.isHtml);
 
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
@@ -1321,15 +1341,15 @@ class TelegramDashboardReporter {
   }
 
   scheduleFromDashboard(dashboard) {
-    if (!this.isActive() || !dashboard || typeof dashboard.getTelegramSnapshot !== "function") {
+    if (!this.isActive() || !dashboard || typeof dashboard.getTelegramSnapshotHtml !== "function") {
       return;
     }
 
-    const snapshot = dashboard.getTelegramSnapshot({
+    const snapshot = dashboard.getTelegramSnapshotHtml({
       accountLimit: this.accountsPerUpdate,
       logLimit: this.logsPerUpdate
     });
-    this.scheduleText(snapshot);
+    this.scheduleText(snapshot, { isHtml: true });
   }
 
   async sendEvent(text, options = {}) {
@@ -1726,6 +1746,10 @@ class PinnedDashboard {
     return value.padEnd(width, " ");
   }
 
+  escapeTelegramCode(value) {
+    return escapeHtml(String(value || "").replace(/\r?\n/g, " "));
+  }
+
   buildRewardSummaryLabel(quality, tier, todayPoints, volume, dailyCheckin) {
     const parts = [];
     const qualityValue = String(quality || "-").trim();
@@ -1967,7 +1991,7 @@ class PinnedDashboard {
 
     const rewardParts = [];
     if (row && row.rewardTier && row.rewardTier !== "-") {
-      rewardParts.push(`Tier ${row.rewardTier}`);
+      rewardParts.push(`Tier ${escapeHtml(row.rewardTier)}`);
     }
     if (row && row.rewardQuality && row.rewardQuality !== "-") {
       rewardParts.push(`Q ${row.rewardQuality}`);
@@ -2031,6 +2055,147 @@ class PinnedDashboard {
     }
 
     return lines;
+  }
+
+  buildTelegramHeaderHtml(options = {}) {
+    const rows = this.parseAccountRows();
+    const modeLabel = String(this.state.mode || "-").toUpperCase();
+    const selectedAccount = this.parseSelectedAccountName() || "-";
+    const tier = String(this.state.rewardTier || "-").trim();
+    const quality = String(this.state.rewardQuality || "-").trim();
+    const todayPoints = String(this.state.rewardTodayPoints || "-").trim();
+    const volume = String(this.state.rewardVolume || "-").trim();
+    const dailyCheckin = String(this.state.rewardDailyCheckin || "-").trim();
+    const shownAccountCount = Math.min(
+      rows.length,
+      Math.max(
+        1,
+        clampToNonNegativeInt(options.accountLimit, rows.length || INTERNAL_API_DEFAULTS.telegram.accountsPerUpdate)
+      )
+    );
+
+    const lines = [
+      `🤖 <b>${escapeHtml(this.projectName)}</b>`,
+      `🕒 Time  <code>${this.escapeTelegramCode(`${getJakartaTimeStamp()} WIB`)}</code>`,
+      `🚦 Run   <b>${escapeHtml(modeLabel)}</b> | ${escapeHtml(String(this.state.phase || "-"))}`,
+      `👤 Acct  <b>${escapeHtml(selectedAccount)}</b> | <code>${this.escapeTelegramCode(`${shownAccountCount}/${rows.length || 0}`)}</code> shown`,
+      `📊 TX    <code>${this.escapeTelegramCode(String(this.state.swapsTotal || "0/0"))}</code> | ok <code>${this.escapeTelegramCode(String(this.state.swapsOk || "0"))}</code> | fail <code>${this.escapeTelegramCode(String(this.state.swapsFail || "0"))}</code> | target <code>${this.escapeTelegramCode(`${this.state.targetPerDay}/day`)}</code>`
+    ];
+
+    const rewardPrimaryParts = [];
+    if (tier && tier !== "-") {
+      rewardPrimaryParts.push(`Tier ${escapeHtml(tier)}`);
+    }
+    if (quality && quality !== "-") {
+      rewardPrimaryParts.push(`Q <code>${this.escapeTelegramCode(quality)}</code>`);
+    }
+    if (todayPoints && todayPoints !== "-") {
+      rewardPrimaryParts.push(`Today <code>${this.escapeTelegramCode(todayPoints)}</code>`);
+    }
+    if (rewardPrimaryParts.length > 0) {
+      lines.push(`🏆 Rewards ${rewardPrimaryParts.join(" | ")}`);
+    }
+
+    const rewardMetaParts = [];
+    if (volume && volume !== "-") {
+      rewardMetaParts.push(`Vol <code>${this.escapeTelegramCode(volume)}</code>`);
+    }
+    if (dailyCheckin && dailyCheckin !== "-") {
+      rewardMetaParts.push(`Check-in <code>${this.escapeTelegramCode(dailyCheckin)}</code>`);
+    }
+    if (rewardMetaParts.length > 0) {
+      lines.push(`📈 ${rewardMetaParts.join(" | ")}`);
+    }
+
+    return lines;
+  }
+
+  buildTelegramAccountBlockHtml(row) {
+    const name = String(row && row.name ? row.name : "-").trim() || "-";
+    const status = String(row && row.status ? row.status : "-").trim() || "-";
+    const cc = String(row && row.cc ? row.cc : "-").trim() || "-";
+    const progress = String(row && row.progress ? row.progress : "-").trim() || "-";
+    const send = String(row && row.send ? row.send : "-").trim() || "-";
+    const lines = [
+      `🔹 <b>${escapeHtml(name)}</b> [${escapeHtml(status)}]`,
+      `<code>CC ${this.escapeTelegramCode(cc)} | TX ${this.escapeTelegramCode(progress)}</code>`
+    ];
+
+    if (send && send !== "-") {
+      lines.push(`📤 ${escapeHtml(this.clip(send, 96))}`);
+    }
+
+    const rewardParts = [];
+    if (row && row.rewardTier && row.rewardTier !== "-") {
+      rewardParts.push(`Tier ${row.rewardTier}`);
+    }
+    if (row && row.rewardQuality && row.rewardQuality !== "-") {
+      rewardParts.push(`Q <code>${this.escapeTelegramCode(row.rewardQuality)}</code>`);
+    }
+    if (row && row.rewardTodayPoints && row.rewardTodayPoints !== "-") {
+      rewardParts.push(`Today <code>${this.escapeTelegramCode(row.rewardTodayPoints)}</code>`);
+    }
+    if (rewardParts.length > 0) {
+      lines.push(`🏆 ${rewardParts.join(" | ")}`);
+    }
+
+    const rewardMetaParts = [];
+    if (row && row.rewardVolume && row.rewardVolume !== "-") {
+      rewardMetaParts.push(`Vol <code>${this.escapeTelegramCode(row.rewardVolume)}</code>`);
+    }
+    if (row && row.rewardDailyCheckin && row.rewardDailyCheckin !== "-") {
+      rewardMetaParts.push(`Check-in <code>${this.escapeTelegramCode(row.rewardDailyCheckin)}</code>`);
+    }
+    if (rewardMetaParts.length > 0) {
+      lines.push(`📈 ${rewardMetaParts.join(" | ")}`);
+    }
+
+    return lines;
+  }
+
+  getTelegramSnapshotHtml(options = {}) {
+    const rows = this.parseAccountRows();
+    const accountLimit = Math.max(
+      1,
+      clampToNonNegativeInt(options.accountLimit, rows.length || INTERNAL_API_DEFAULTS.telegram.accountsPerUpdate)
+    );
+    const logLimit = Math.max(
+      1,
+      clampToNonNegativeInt(options.logLimit, this.logs.length || INTERNAL_API_DEFAULTS.telegram.logsPerUpdate)
+    );
+
+    const lines = [...this.buildTelegramHeaderHtml({ accountLimit })];
+    lines.push("");
+
+    if (rows.length === 0) {
+      lines.push("🔹 <i>(no account rows yet)</i>");
+    } else {
+      for (const row of rows.slice(0, accountLimit)) {
+        lines.push(...this.buildTelegramAccountBlockHtml(row));
+        lines.push("");
+      }
+      if (rows.length > accountLimit) {
+        lines.push(`➕ <i>${rows.length - accountLimit} akun lainnya</i>`);
+      }
+    }
+
+    while (lines.length > 0 && !String(lines[lines.length - 1]).trim()) {
+      lines.pop();
+    }
+
+    const logLines = [];
+    if (this.logs.length === 0) {
+      logLines.push("- [--:--:--] INFO (no logs yet)");
+    } else {
+      for (const log of this.logs.slice(-logLimit)) {
+        logLines.push(`- ${log.time} ${log.level} ${this.clip(log.message, 96)}`);
+      }
+    }
+
+    lines.push("");
+    lines.push(`📜 <b>Latest Logs</b> <code>${this.escapeTelegramCode(`${Math.min(this.logs.length, logLimit)}/${this.logs.length}`)}</code>`);
+    lines.push(`<pre>${escapeHtml(logLines.join("\n"))}</pre>`);
+    return lines.join("\n");
   }
 
   getTelegramSnapshot(options = {}) {
@@ -6483,11 +6648,12 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
     if (delayTxMaxSec > 0) {
       const delayTxSec = randomIntInclusive(delayTxMinSec, delayTxMaxSec);
       const delayTargetLabel = hasMoreTxAfterCurrent ? "next tx" : "balance refresh";
+      const delayTargetShortLabel = hasMoreTxAfterCurrent ? "next tx" : "balance";
       console.log(`[info] Waiting ${delayTxSec}s after successful tx before ${delayTargetLabel}...`);
       dashboard.setState({
         phase: "cooldown",
         cooldown: `${delayTxSec}s`,
-        send: `Post-success cooldown ${delayTxSec}s before ${delayTargetLabel}`
+        send: `${sendRequest.amount} CC -> ${sendRequest.label} | cooldown ${delayTxSec}s before ${delayTargetShortLabel}`
       });
       await sleep(delayTxSec * 1000);
     }
