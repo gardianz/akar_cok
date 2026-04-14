@@ -975,6 +975,8 @@ function getPerAccountTxStats(accountName) {
 
 const qualityScoreByAccount = new Map();
 const quarantinedAccounts = new Set();
+const rewardsThisWeekByAccount = new Map();
+const rewardsInitialByAccount = new Map();
 
 function parseQualityScoreNumber(rawValue) {
   const numeric = Number(rawValue);
@@ -1048,6 +1050,184 @@ function updateAccountQualityState(accountName, score, minScoreThreshold, accoun
   }
 
   return numericScore;
+}
+
+function parseRewardMetricNumber(rawValue) {
+  if (rawValue === null || rawValue === undefined || rawValue === "" || typeof rawValue === "boolean") {
+    return null;
+  }
+
+  const numeric = Number(rawValue);
+  if (Number.isFinite(numeric)) {
+    return numeric;
+  }
+
+  const text = String(rawValue).trim();
+  if (!text) {
+    return null;
+  }
+
+  const normalized = text.replace(/,/g, "").replace(/[^0-9.+-]/g, "");
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractThisWeekRewardMetricsFromResponse(payload) {
+  const data = isObject(payload && payload.data) ? payload.data : {};
+  const tierProgress = isObject(data.tierProgress) ? data.tierProgress : {};
+  const thisWeek = isObject(data.thisWeek) ? data.thisWeek : {};
+  const weekly = isObject(data.weekly) ? data.weekly : {};
+
+  const ccCandidates = [
+    data.earnedThisWeekCc,
+    data.thisWeekCc,
+    data.rewardThisWeekCc,
+    data.rewardsThisWeekCc,
+    data.thisWeekRewardCc,
+    data.weeklyRewardCc,
+    tierProgress.earnedThisWeekCc,
+    tierProgress.thisWeekRewardCc,
+    tierProgress.rewardThisWeekCc,
+    tierProgress.thisWeekCc,
+    tierProgress.rewardsThisWeekCc,
+    thisWeek.cc,
+    thisWeek.amount,
+    weekly.cc,
+    weekly.amount
+  ];
+
+  const usdCandidates = [
+    data.accruedThisWeekUsd,
+    data.thisWeekRewardUsd,
+    data.rewardThisWeekUsd,
+    data.rewardsThisWeekUsd,
+    data.weeklyRewardUsd,
+    tierProgress.accruedThisWeekUsd,
+    tierProgress.thisWeekRewardUsd,
+    tierProgress.rewardThisWeekUsd,
+    tierProgress.rewardsThisWeekUsd,
+    thisWeek.usd,
+    thisWeek.valueUsd,
+    weekly.usd,
+    weekly.valueUsd
+  ];
+
+  let cc = null;
+  let usd = null;
+
+  for (const candidate of ccCandidates) {
+    const parsed = parseRewardMetricNumber(candidate);
+    if (parsed !== null) {
+      cc = parsed;
+      break;
+    }
+  }
+
+  for (const candidate of usdCandidates) {
+    const parsed = parseRewardMetricNumber(candidate);
+    if (parsed !== null) {
+      usd = parsed;
+      break;
+    }
+  }
+
+  return { cc, usd };
+}
+
+function getAccountRewardsThisWeek(accountName) {
+  const normalizedName = String(accountName || "").trim();
+  if (!normalizedName || !rewardsThisWeekByAccount.has(normalizedName)) {
+    return null;
+  }
+  return rewardsThisWeekByAccount.get(normalizedName);
+}
+
+function getAccountRewardsInitial(accountName) {
+  const normalizedName = String(accountName || "").trim();
+  if (!normalizedName || !rewardsInitialByAccount.has(normalizedName)) {
+    return null;
+  }
+  return rewardsInitialByAccount.get(normalizedName);
+}
+
+function getAccountRewardsDiff(accountName) {
+  const current = getAccountRewardsThisWeek(accountName);
+  const initial = getAccountRewardsInitial(accountName);
+  if (!isObject(current) || !isObject(initial)) {
+    return null;
+  }
+
+  const diffCc =
+    Number.isFinite(current.cc) && Number.isFinite(initial.cc)
+      ? current.cc - initial.cc
+      : null;
+  const diffUsd =
+    Number.isFinite(current.usd) && Number.isFinite(initial.usd)
+      ? current.usd - initial.usd
+      : null;
+
+  if (diffCc === null && diffUsd === null) {
+    return null;
+  }
+
+  return { cc: diffCc, usd: diffUsd };
+}
+
+function getTotalRewardsThisWeek() {
+  let totalCc = 0;
+  let totalUsd = 0;
+  let hasCc = false;
+  let hasUsd = false;
+
+  for (const entry of rewardsThisWeekByAccount.values()) {
+    if (!isObject(entry)) {
+      continue;
+    }
+    if (Number.isFinite(entry.cc)) {
+      totalCc += entry.cc;
+      hasCc = true;
+    }
+    if (Number.isFinite(entry.usd)) {
+      totalUsd += entry.usd;
+      hasUsd = true;
+    }
+  }
+
+  return {
+    cc: hasCc ? totalCc : null,
+    usd: hasUsd ? totalUsd : null
+  };
+}
+
+function getTotalRewardsDiff() {
+  let totalCc = 0;
+  let totalUsd = 0;
+  let hasCc = false;
+  let hasUsd = false;
+
+  for (const accountName of rewardsThisWeekByAccount.keys()) {
+    const diff = getAccountRewardsDiff(accountName);
+    if (!isObject(diff)) {
+      continue;
+    }
+    if (Number.isFinite(diff.cc)) {
+      totalCc += diff.cc;
+      hasCc = true;
+    }
+    if (Number.isFinite(diff.usd)) {
+      totalUsd += diff.usd;
+      hasUsd = true;
+    }
+  }
+
+  return {
+    cc: hasCc ? totalCc : null,
+    usd: hasUsd ? totalUsd : null
+  };
 }
 
 const INTERNAL_API_DEFAULTS = {
@@ -1671,6 +1851,8 @@ class PinnedDashboard {
       send: "-",
       transfer: "-",
       reward: "-",
+      rewardsThisWeek: "-",
+      rewardsDiff: "-",
       rewardQuality: "-",
       rewardTier: "-",
       rewardTodayPoints: "-",
@@ -1790,6 +1972,28 @@ class PinnedDashboard {
     return escapeHtml(String(value || "").replace(/\r?\n/g, " "));
   }
 
+  formatRewardsThisWeek(accountName, snapshotFallback = "-") {
+    const entry = getAccountRewardsThisWeek(accountName);
+    if (isObject(entry)) {
+      const ccLabel = Number.isFinite(entry.cc) ? entry.cc.toFixed(2) : "?";
+      const usdLabel = Number.isFinite(entry.usd) ? entry.usd.toFixed(2) : "?";
+      return `${ccLabel} CC ($${usdLabel})`;
+    }
+    const fallback = String(snapshotFallback || "-").trim();
+    return fallback || "-";
+  }
+
+  formatRewardsDiff(accountName, snapshotFallback = "-") {
+    const diff = getAccountRewardsDiff(accountName);
+    if (isObject(diff)) {
+      const ccLabel = Number.isFinite(diff.cc) ? `${diff.cc >= 0 ? "+" : ""}${diff.cc.toFixed(2)} CC` : "?";
+      const usdLabel = Number.isFinite(diff.usd) ? `${diff.usd >= 0 ? "+" : ""}$${diff.usd.toFixed(2)}` : "?";
+      return `${ccLabel} (${usdLabel})`;
+    }
+    const fallback = String(snapshotFallback || "-").trim();
+    return fallback || "-";
+  }
+
   buildRewardSummaryLabel(reward, quality, tier, todayPoints, volume, dailyCheckin) {
     const parts = [];
     const rewardValue = String(reward || "-").trim();
@@ -1874,6 +2078,8 @@ class PinnedDashboard {
     const balances = this.parseBalanceFields();
     const currentSend = String(this.state.send || "-").trim();
     const currentReward = String(this.state.reward || "-").trim();
+    const currentRewardsThisWeek = String(this.state.rewardsThisWeek || "-").trim();
+    const currentRewardsDiff = String(this.state.rewardsDiff || "-").trim();
     const currentRewardQuality = String(this.state.rewardQuality || "-").trim();
     const currentRewardTier = String(this.state.rewardTier || "-").trim();
     const currentRewardTodayPoints = String(this.state.rewardTodayPoints || "-").trim();
@@ -1889,6 +2095,10 @@ class PinnedDashboard {
       progress: currentProgress !== "-" ? currentProgress : String(prev.progress || "-"),
       send: currentSend !== "-" ? currentSend : String(prev.send || "-"),
       reward: currentReward !== "-" ? currentReward : String(prev.reward || "-"),
+      rewardsThisWeek:
+        currentRewardsThisWeek !== "-" ? currentRewardsThisWeek : String(prev.rewardsThisWeek || "-"),
+      rewardsDiff:
+        currentRewardsDiff !== "-" ? currentRewardsDiff : String(prev.rewardsDiff || "-"),
       rewardQuality:
         currentRewardQuality !== "-" ? currentRewardQuality : String(prev.rewardQuality || "-"),
       rewardTier: currentRewardTier !== "-" ? currentRewardTier : String(prev.rewardTier || "-"),
@@ -1942,6 +2152,12 @@ class PinnedDashboard {
         reward: isSelected
           ? (String(this.state.reward || "-") !== "-" ? String(this.state.reward || "-") : String(snapshot.reward || "-"))
           : String(snapshot.reward || "-"),
+        rewardsThisWeek: isSelected
+          ? this.formatRewardsThisWeek(name, String(this.state.rewardsThisWeek || snapshot.rewardsThisWeek || "-"))
+          : this.formatRewardsThisWeek(name, String(snapshot.rewardsThisWeek || "-")),
+        rewardsDiff: isSelected
+          ? this.formatRewardsDiff(name, String(this.state.rewardsDiff || snapshot.rewardsDiff || "-"))
+          : this.formatRewardsDiff(name, String(snapshot.rewardsDiff || "-")),
         rewardQuality: isSelected
           ? (String(this.state.rewardQuality || "-") !== "-" ? String(this.state.rewardQuality || "-") : String(snapshot.rewardQuality || "-"))
           : String(snapshot.rewardQuality || "-"),
@@ -1974,6 +2190,8 @@ class PinnedDashboard {
         progress: currentProgress,
         send: String(this.state.send || "-") !== "-" ? String(this.state.send || "-") : String(snapshot.send || "-"),
         reward: String(this.state.reward || "-") !== "-" ? String(this.state.reward || "-") : String(snapshot.reward || "-"),
+        rewardsThisWeek: this.formatRewardsThisWeek(selected, String(this.state.rewardsThisWeek || snapshot.rewardsThisWeek || "-")),
+        rewardsDiff: this.formatRewardsDiff(selected, String(this.state.rewardsDiff || snapshot.rewardsDiff || "-")),
         rewardQuality:
           String(this.state.rewardQuality || "-") !== "-"
             ? String(this.state.rewardQuality || "-")
@@ -1999,7 +2217,7 @@ class PinnedDashboard {
 
     for (const row of rows) {
       row.rewardSummary = this.buildRewardSummaryLabel(
-        row.reward,
+        row.rewardsThisWeek && row.rewardsThisWeek !== "-" ? row.rewardsThisWeek : row.reward,
         row.rewardQuality,
         row.rewardTier,
         row.rewardTodayPoints,
@@ -2035,10 +2253,20 @@ class PinnedDashboard {
       lines.push(`  Send ${this.clip(send, 72)}`);
     }
 
-    const rewardParts = [];
-    if (row && row.reward && row.reward !== "-") {
-      rewardParts.push(`${escapeHtml(row.reward)}`);
+    const rewardsThisWeek = String(row && row.rewardsThisWeek ? row.rewardsThisWeek : "-").trim() || "-";
+    const rewardsDiff = String(row && row.rewardsDiff ? row.rewardsDiff : "-").trim() || "-";
+    if ((rewardsThisWeek && rewardsThisWeek !== "-") || (rewardsDiff && rewardsDiff !== "-")) {
+      const weekDiffParts = [];
+      if (rewardsThisWeek && rewardsThisWeek !== "-") {
+        weekDiffParts.push(`Week ${rewardsThisWeek}`);
+      }
+      if (rewardsDiff && rewardsDiff !== "-") {
+        weekDiffParts.push(`Diff ${rewardsDiff}`);
+      }
+      lines.push(`  ${this.clip(weekDiffParts.join(" | "), 72)}`);
     }
+
+    const rewardParts = [];
     if (row && row.rewardTier && row.rewardTier !== "-") {
       rewardParts.push(`Tier ${escapeHtml(row.rewardTier)}`);
     }
@@ -2069,7 +2297,9 @@ class PinnedDashboard {
   }
 
   buildTelegramSelectedRewardsLines() {
+    const rewardsThisWeek = String(this.state.rewardsThisWeek || "-").trim();
     const reward = String(this.state.reward || "-").trim();
+    const rewardsDiff = String(this.state.rewardsDiff || "-").trim();
     const tier = String(this.state.rewardTier || "-").trim();
     const quality = String(this.state.rewardQuality || "-").trim();
     const todayPoints = String(this.state.rewardTodayPoints || "-").trim();
@@ -2080,7 +2310,9 @@ class PinnedDashboard {
     const primaryParts = [];
     const secondaryParts = [];
 
-    if (reward && reward !== "-") {
+    if (rewardsThisWeek && rewardsThisWeek !== "-") {
+      primaryParts.push(rewardsThisWeek);
+    } else if (reward && reward !== "-") {
       primaryParts.push(reward);
     }
     if (tier && tier !== "-") {
@@ -2106,6 +2338,9 @@ class PinnedDashboard {
     if (secondaryParts.length > 0) {
       lines.push(`        ${this.clip(secondaryParts.join(" | "), 86)}`);
     }
+    if (rewardsDiff && rewardsDiff !== "-") {
+      lines.push(`        ${this.clip(`Diff ${rewardsDiff}`, 86)}`);
+    }
 
     return lines;
   }
@@ -2114,6 +2349,8 @@ class PinnedDashboard {
     const rows = this.parseAccountRows();
     const modeLabel = String(this.state.mode || "-").toUpperCase();
     const selectedAccount = this.parseSelectedAccountName() || "-";
+    const rewardsThisWeek = String(this.state.rewardsThisWeek || "-").trim();
+    const rewardsDiff = String(this.state.rewardsDiff || "-").trim();
     const reward = String(this.state.reward || "-").trim();
     const tier = String(this.state.rewardTier || "-").trim();
     const quality = String(this.state.rewardQuality || "-").trim();
@@ -2122,6 +2359,8 @@ class PinnedDashboard {
     const dailyCheckin = String(this.state.rewardDailyCheckin || "-").trim();
     const txStats = getGlobalTxStatsSnapshot();
     const txProgressLabel = `${txStats.total}/${txStats.total}`;
+    const rewardsTotals = getTotalRewardsThisWeek();
+    const rewardsDiffTotals = getTotalRewardsDiff();
     const shownAccountCount = Math.min(
       rows.length,
       Math.max(
@@ -2166,6 +2405,35 @@ class PinnedDashboard {
       lines.push(`📈 ${rewardMetaParts.join(" | ")}`);
     }
 
+    const selectedWeekDiffParts = [];
+    if (rewardsThisWeek && rewardsThisWeek !== "-") {
+      selectedWeekDiffParts.push(`Week <code>${this.escapeTelegramCode(rewardsThisWeek)}</code>`);
+    } else if (reward && reward !== "-") {
+      selectedWeekDiffParts.push(`Week <code>${this.escapeTelegramCode(reward)}</code>`);
+    }
+    if (rewardsDiff && rewardsDiff !== "-") {
+      selectedWeekDiffParts.push(`Diff <code>${this.escapeTelegramCode(rewardsDiff)}</code>`);
+    }
+    if (selectedWeekDiffParts.length > 0) {
+      lines.push(`💵 ${selectedWeekDiffParts.join(" | ")}`);
+    }
+
+    if (Number.isFinite(rewardsTotals.cc) || Number.isFinite(rewardsTotals.usd)) {
+      const totalCcLabel = Number.isFinite(rewardsTotals.cc) ? `${rewardsTotals.cc.toFixed(2)} CC` : "?";
+      const totalUsdLabel = Number.isFinite(rewardsTotals.usd) ? `$${rewardsTotals.usd.toFixed(2)}` : "?";
+      lines.push(`💰 Week Total <code>${this.escapeTelegramCode(totalCcLabel)}</code> | <code>${this.escapeTelegramCode(totalUsdLabel)}</code>`);
+    }
+
+    if (Number.isFinite(rewardsDiffTotals.cc) || Number.isFinite(rewardsDiffTotals.usd)) {
+      const totalDiffCc = Number.isFinite(rewardsDiffTotals.cc)
+        ? `${rewardsDiffTotals.cc >= 0 ? "+" : ""}${rewardsDiffTotals.cc.toFixed(2)} CC`
+        : "?";
+      const totalDiffUsd = Number.isFinite(rewardsDiffTotals.usd)
+        ? `${rewardsDiffTotals.usd >= 0 ? "+" : ""}$${rewardsDiffTotals.usd.toFixed(2)}`
+        : "?";
+      lines.push(`📈 Session Earn <code>${this.escapeTelegramCode(totalDiffCc)}</code> | <code>${this.escapeTelegramCode(totalDiffUsd)}</code>`);
+    }
+
     return lines;
   }
 
@@ -2184,10 +2452,20 @@ class PinnedDashboard {
       lines.push(`📤 ${escapeHtml(this.clip(send, 96))}`);
     }
 
-    const rewardParts = [];
-    if (row && row.reward && row.reward !== "-") {
-      rewardParts.push(`<code>${this.escapeTelegramCode(row.reward)}</code>`);
+    const rewardsThisWeek = String(row && row.rewardsThisWeek ? row.rewardsThisWeek : "-").trim() || "-";
+    const rewardsDiff = String(row && row.rewardsDiff ? row.rewardsDiff : "-").trim() || "-";
+    if ((rewardsThisWeek && rewardsThisWeek !== "-") || (rewardsDiff && rewardsDiff !== "-")) {
+      const weekDiffParts = [];
+      if (rewardsThisWeek && rewardsThisWeek !== "-") {
+        weekDiffParts.push(`Week <code>${this.escapeTelegramCode(rewardsThisWeek)}</code>`);
+      }
+      if (rewardsDiff && rewardsDiff !== "-") {
+        weekDiffParts.push(`Diff <code>${this.escapeTelegramCode(rewardsDiff)}</code>`);
+      }
+      lines.push(`💵 ${weekDiffParts.join(" | ")}`);
     }
+
+    const rewardParts = [];
     if (row && row.rewardTier && row.rewardTier !== "-") {
       rewardParts.push(`Tier ${row.rewardTier}`);
     }
@@ -2275,6 +2553,8 @@ class PinnedDashboard {
     const selectedAccount = this.parseSelectedAccountName() || "-";
     const txStats = getGlobalTxStatsSnapshot();
     const txProgressLabel = `${txStats.total}/${txStats.total}`;
+    const rewardsTotals = getTotalRewardsThisWeek();
+    const rewardsDiffTotals = getTotalRewardsDiff();
     const shownAccountCount = Math.min(rows.length, accountLimit);
 
     const lines = [
@@ -2287,6 +2567,20 @@ class PinnedDashboard {
     const selectedRewardLines = this.buildTelegramSelectedRewardsLines();
     if (selectedRewardLines.length > 0) {
       lines.push(...selectedRewardLines);
+    }
+    if (Number.isFinite(rewardsTotals.cc) || Number.isFinite(rewardsTotals.usd)) {
+      const totalCcLabel = Number.isFinite(rewardsTotals.cc) ? `${rewardsTotals.cc.toFixed(2)} CC` : "?";
+      const totalUsdLabel = Number.isFinite(rewardsTotals.usd) ? `$${rewardsTotals.usd.toFixed(2)}` : "?";
+      lines.push(`Week Total ${totalCcLabel} | ${totalUsdLabel}`);
+    }
+    if (Number.isFinite(rewardsDiffTotals.cc) || Number.isFinite(rewardsDiffTotals.usd)) {
+      const totalDiffCc = Number.isFinite(rewardsDiffTotals.cc)
+        ? `${rewardsDiffTotals.cc >= 0 ? "+" : ""}${rewardsDiffTotals.cc.toFixed(2)} CC`
+        : "?";
+      const totalDiffUsd = Number.isFinite(rewardsDiffTotals.usd)
+        ? `${rewardsDiffTotals.usd >= 0 ? "+" : ""}$${rewardsDiffTotals.usd.toFixed(2)}`
+        : "?";
+      lines.push(`Session Earn ${totalDiffCc} | ${totalDiffUsd}`);
     }
 
     lines.push(
@@ -2336,20 +2630,23 @@ class PinnedDashboard {
       const midBorder = `+${"-".repeat(frameWidth - 2)}+`;
       const bannerLine = (text) => `| ${this.formatCell(text, contentWidth)} |`;
 
-      const columnCount = 6;
+      const columnCount = 7;
       const separatorWidth = 3 * (columnCount - 1);
-      const accountWidth = 14;
-      const statusWidth = 9;
+      const accountWidth = 12;
+      const statusWidth = 8;
       const ccWidth = 10;
-      const txProgressWidth = 20;
-      const rewardWidth = 52;
+      const txProgressWidth = 16;
+      const diffWidth = 22;
+      const rewardWidth = 34;
       const sendPlanWidth = Math.max(
-        20,
-        contentWidth - separatorWidth - (accountWidth + statusWidth + ccWidth + txProgressWidth + rewardWidth)
+        18,
+        contentWidth - separatorWidth - (accountWidth + statusWidth + ccWidth + txProgressWidth + rewardWidth + diffWidth)
       );
-      const tableWidths = [accountWidth, statusWidth, ccWidth, txProgressWidth, sendPlanWidth, rewardWidth];
+      const tableWidths = [accountWidth, statusWidth, ccWidth, txProgressWidth, sendPlanWidth, rewardWidth, diffWidth];
       const tableRow = (cells) => `| ${cells.map((cell, idx) => this.formatCell(cell, tableWidths[idx])).join(" | ")} |`;
       const tableRule = (char) => `| ${tableWidths.map((width) => char.repeat(width)).join(" | ")} |`;
+      const rewardsTotals = getTotalRewardsThisWeek();
+      const rewardsDiffTotals = getTotalRewardsDiff();
 
       const lines = [];
       lines.push(topBorder);
@@ -2363,23 +2660,46 @@ class PinnedDashboard {
           `Sends: ${txStats.total}/${txStats.total} total  ${txStats.ok} ok  ${txStats.fail} fail  |  Target: ${this.state.targetPerDay}/day`
         )
       );
+      if (Number.isFinite(rewardsTotals.cc) || Number.isFinite(rewardsTotals.usd)) {
+        const totalCcLabel = Number.isFinite(rewardsTotals.cc) ? `${rewardsTotals.cc.toFixed(2)} CC` : "?";
+        const totalUsdLabel = Number.isFinite(rewardsTotals.usd) ? `$${rewardsTotals.usd.toFixed(2)}` : "?";
+        lines.push(
+          bannerLine(
+            `Rewards this week (all accounts): ${totalCcLabel}  |  ${totalUsdLabel}`
+          )
+        );
+      }
+      if (Number.isFinite(rewardsDiffTotals.cc) || Number.isFinite(rewardsDiffTotals.usd)) {
+        const totalDiffCc = Number.isFinite(rewardsDiffTotals.cc)
+          ? `${rewardsDiffTotals.cc >= 0 ? "+" : ""}${rewardsDiffTotals.cc.toFixed(2)} CC`
+          : "?";
+        const totalDiffUsd = Number.isFinite(rewardsDiffTotals.usd)
+          ? `${rewardsDiffTotals.usd >= 0 ? "+" : ""}$${rewardsDiffTotals.usd.toFixed(2)}`
+          : "?";
+        lines.push(
+          bannerLine(
+            `Session earnings (all accounts): ${totalDiffCc}  |  ${totalDiffUsd}`
+          )
+        );
+      }
       lines.push(
         bannerLine(
           `State: ${this.state.phase}`
         )
       );
       lines.push(midBorder);
-      lines.push(tableRow(["Akun", "Status", "CC", "TX Progress", "Send Plan", "Reward / Tier / Q / Today / Vol / Check-in"]));
+      lines.push(tableRow(["Akun", "Status", "CC", "TX Progress", "Send Plan", "Rewards / Score / Tier", "Diff Reward"]));
       lines.push(tableRule("-"));
 
       if (rows.length === 0) {
-        lines.push(tableRow(["-", "IDLE", "-", "-", "-", "-"]));
+        lines.push(tableRow(["-", "IDLE", "-", "-", "-", "-", "-"]));
       } else {
         for (const row of rows) {
           const progressLabel = String(row.progress || "-");
           const sendLabel = String(row.send || "-");
           const rewardLabel = String(row.rewardSummary || "-");
-          lines.push(tableRow([row.name, row.status, row.cc, progressLabel, sendLabel, rewardLabel]));
+          const diffLabel = String(row.rewardsDiff || "-");
+          lines.push(tableRow([row.name, row.status, row.cc, progressLabel, sendLabel, rewardLabel, diffLabel]));
         }
       }
 
@@ -6167,6 +6487,8 @@ function extractRewardsInsightsFromResponse(payload) {
 
 async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag = null, accountName = null, minScoreThreshold = null) {
   let rewardLabel = "-";
+  let rewardsThisWeekLabel = "-";
+  let rewardsDiffLabel = "-";
   let qualityLabel = "-";
   let tierLabel = "-";
   let todayPointsLabel = "-";
@@ -6177,6 +6499,20 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
   try {
     const overviewResponse = await client.getRewardsOverview();
     rewardLabel = extractThisWeekRewardLabelFromResponse(overviewResponse);
+    const rewardMetrics = extractThisWeekRewardMetricsFromResponse(overviewResponse);
+    if (accountName && (Number.isFinite(rewardMetrics.cc) || Number.isFinite(rewardMetrics.usd))) {
+      const normalizedName = String(accountName).trim();
+      const nextMetrics = {
+        cc: Number.isFinite(rewardMetrics.cc) ? rewardMetrics.cc : 0,
+        usd: Number.isFinite(rewardMetrics.usd) ? rewardMetrics.usd : 0
+      };
+      rewardsThisWeekByAccount.set(normalizedName, nextMetrics);
+      if (!rewardsInitialByAccount.has(normalizedName)) {
+        rewardsInitialByAccount.set(normalizedName, { ...nextMetrics });
+      }
+      rewardsThisWeekLabel = dashboard.formatRewardsThisWeek(normalizedName, rewardLabel);
+      rewardsDiffLabel = dashboard.formatRewardsDiff(normalizedName, "-");
+    }
     const insights = extractRewardsInsightsFromResponse(overviewResponse);
     qualityLabel = insights.quality;
     tierLabel = insights.tier;
@@ -6220,6 +6556,8 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
 
   if (
     rewardLabel !== "-" ||
+    rewardsThisWeekLabel !== "-" ||
+    rewardsDiffLabel !== "-" ||
     qualityLabel !== "-" ||
     tierLabel !== "-" ||
     todayPointsLabel !== "-" ||
@@ -6236,6 +6574,8 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
     );
     dashboard.setState({
       reward: rewardLabel,
+      rewardsThisWeek: rewardsThisWeekLabel,
+      rewardsDiff: rewardsDiffLabel,
       rewardQuality: qualityLabel,
       rewardTier: tierLabel,
       rewardTodayPoints: todayPointsLabel,
@@ -6243,6 +6583,14 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
       rewardDailyCheckin: dailyCheckinLabel
     });
     console.log(withAccountTag(accountLogTag, `[info] Rewards stats: ${summaryLabel}`));
+    if (rewardsThisWeekLabel !== "-" || rewardsDiffLabel !== "-") {
+      console.log(
+        withAccountTag(
+          accountLogTag,
+          `[info] Rewards week/diff: ${rewardsThisWeekLabel !== "-" ? rewardsThisWeekLabel : "-"} | ${rewardsDiffLabel !== "-" ? rewardsDiffLabel : "-"}`
+        )
+      );
+    }
   }
   // Don't log warning for timeout - just silently skip
   return {
