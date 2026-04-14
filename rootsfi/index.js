@@ -713,7 +713,10 @@ function buildInternalSendRequests(
   senderName,
   sendPolicy,
   loopRound = null,
-  avoidRecipientNames = []
+  avoidRecipientNames = [],
+  preferredRecipientNames = [],
+  fixedAmountInput = null,
+  options = null
 ) {
   const validAccounts = Array.isArray(accounts)
     ? accounts.filter((acc) => String(acc && acc.address ? acc.address : "").trim())
@@ -725,6 +728,7 @@ function buildInternalSendRequests(
           .filter((item) => Boolean(item))
       : []
   );
+  const quiet = isObject(options) && options.quiet === true;
 
   if (validAccounts.length < 2) {
     console.log(
@@ -752,7 +756,9 @@ function buildInternalSendRequests(
   }
 
   cleanupExpiredSendPairs();
-  const amount = generateRandomCcAmount(sendPolicy, getAccountTierKey(senderName));
+  const amount = fixedAmountInput
+    ? normalizeCcAmount(fixedAmountInput)
+    : generateRandomCcAmount(sendPolicy, getAccountTierKey(senderName));
   let requests = [];
   let shortestBlockedCooldownSeconds = 0;
   let skippedByAvoidCount = 0;
@@ -769,17 +775,25 @@ function buildInternalSendRequests(
   }
 
   if (coveragePrep.restartedEpoch && coveragePrep.completedEpoch) {
-    console.log(
-      `[internal] ${senderName}: full recipient coverage completed, starting shuffled epoch ${coverageEntry.epoch}`
-    );
+    if (!quiet) {
+      console.log(
+        `[internal] ${senderName}: full recipient coverage completed, starting shuffled epoch ${coverageEntry.epoch}`
+      );
+    }
   }
 
-  const pendingRecipientQueue = [...coverageEntry.pendingRecipients];
+  const pendingRecipientQueue = applyPreferredRecipientOrder(
+    [...coverageEntry.pendingRecipients],
+    preferredRecipientNames
+  );
   const pendingRecipientSet = new Set(pendingRecipientQueue);
-  const coveredRecipientPool = shuffleArray(
-    sortedAccounts
+  const coveredRecipientPool = applyPreferredRecipientOrder(
+    shuffleArray(
+      sortedAccounts
       .map((account) => String(account && account.name ? account.name : "").trim())
       .filter((name) => Boolean(name) && name !== senderName && !pendingRecipientSet.has(name))
+    ),
+    preferredRecipientNames
   );
 
   const buildRequest = (recipientName, sourceLabel) => {
@@ -863,13 +877,15 @@ function buildInternalSendRequests(
     const reason = hasAvoidOnlyBlock
       ? "internal-avoid-sendback"
       : (pendingRecipientQueue.length > 0 ? "internal-coverage-cooldown" : "internal-reciprocal-cooldown");
-    console.log(
-      `[internal] ${senderName}: no eligible recipient. ` +
-      `pending=${pendingRecipientQueue.length}/${Math.max(1, sortedAccounts.length - 1)} ` +
-      `cooldownRetry=${shortestCooldownSeconds || 0}s avoidBlocked=${skippedByAvoidCount} ` +
-      `quarantinedBlocked=${skippedByQuarantineCount} ` +
-      `(retryAfter=${retryAfterSeconds}s reason=${reason})`
-    );
+    if (!quiet) {
+      console.log(
+        `[internal] ${senderName}: no eligible recipient. ` +
+        `pending=${pendingRecipientQueue.length}/${Math.max(1, sortedAccounts.length - 1)} ` +
+        `cooldownRetry=${shortestCooldownSeconds || 0}s avoidBlocked=${skippedByAvoidCount} ` +
+        `quarantinedBlocked=${skippedByQuarantineCount} ` +
+        `(retryAfter=${retryAfterSeconds}s reason=${reason})`
+      );
+    }
     return {
       requests: [],
       reason,
@@ -880,11 +896,13 @@ function buildInternalSendRequests(
 
   const preview = requests.slice(0, 4).map((entry) => entry.label).join(", ");
   const suffix = requests.length > 4 ? ` (+${requests.length - 4} more)` : "";
-  console.log(
-    `[internal] ${senderName}: epoch=${coverageEntry.epoch} remaining=${pendingRecipientQueue.length}/${Math.max(1, sortedAccounts.length - 1)} ` +
-    `phase=${activePhase} primary=${requests[0].label} offset=${primaryOffset} ` +
-    `pool=[${preview}${suffix}]`
-  );
+  if (!quiet) {
+    console.log(
+      `[internal] ${senderName}: epoch=${coverageEntry.epoch} remaining=${pendingRecipientQueue.length}/${Math.max(1, sortedAccounts.length - 1)} ` +
+      `phase=${activePhase} primary=${requests[0].label} offset=${primaryOffset} ` +
+      `pool=[${preview}${suffix}]`
+    );
+  }
 
   return {
     requests,
@@ -3786,6 +3804,330 @@ function parseSnapshotCcBalance(value) {
   return Number.isFinite(numeric) ? numeric : Number.POSITIVE_INFINITY;
 }
 
+function getPlanningCcBalance(accountName, accountSnapshots = {}, fallback = 0) {
+  const name = String(accountName || "").trim();
+  if (!name) {
+    return fallback;
+  }
+
+  const snapshot = isObject(accountSnapshots) && isObject(accountSnapshots[name])
+    ? accountSnapshots[name]
+    : {};
+  const balance = parseSnapshotCcBalance(snapshot.cc);
+  return Number.isFinite(balance) ? balance : fallback;
+}
+
+function buildBalanceAwareRecipientPriority(
+  candidateNames,
+  projectedBalances,
+  projectedRecipientLoads,
+  senderName
+) {
+  const sender = String(senderName || "").trim();
+  const uniqueCandidates = Array.from(
+    new Set(
+      Array.isArray(candidateNames)
+        ? candidateNames
+            .map((name) => String(name || "").trim())
+            .filter((name) => Boolean(name) && name !== sender)
+        : []
+    )
+  );
+  const originalOrder = new Map();
+  uniqueCandidates.forEach((candidate, index) => {
+    if (!originalOrder.has(candidate)) {
+      originalOrder.set(candidate, index);
+    }
+  });
+
+  return uniqueCandidates.sort((left, right) => {
+    const leftBalance = Number(projectedBalances.get(left));
+    const rightBalance = Number(projectedBalances.get(right));
+    const leftBalanceKey = Number.isFinite(leftBalance) ? leftBalance : Number.POSITIVE_INFINITY;
+    const rightBalanceKey = Number.isFinite(rightBalance) ? rightBalance : Number.POSITIVE_INFINITY;
+    if (leftBalanceKey !== rightBalanceKey) {
+      return leftBalanceKey - rightBalanceKey;
+    }
+
+    const leftTx = getPerAccountTxStats(left).total;
+    const rightTx = getPerAccountTxStats(right).total;
+    if (leftTx !== rightTx) {
+      return leftTx - rightTx;
+    }
+
+    const leftLoad = Number(projectedRecipientLoads.get(left) || 0);
+    const rightLoad = Number(projectedRecipientLoads.get(right) || 0);
+    if (leftLoad !== rightLoad) {
+      return leftLoad - rightLoad;
+    }
+
+    const leftOrder = Number(originalOrder.get(left));
+    const rightOrder = Number(originalOrder.get(right));
+    if (leftOrder !== rightOrder) {
+      return leftOrder - rightOrder;
+    }
+
+    return left.localeCompare(right);
+  });
+}
+
+function getTierMinimumAmountForSender(sendPolicy, senderName) {
+  const tierKey = getAccountTierKey(senderName);
+  const tierRange = resolveAmountRangeForTier(sendPolicy, tierKey);
+  const tierMin = Number(tierRange && tierRange.min);
+  return Number.isFinite(tierMin) ? tierMin : 0;
+}
+
+function generateTierBalancedAmount(sendPolicy, senderName, spendableAmount) {
+  const tierKey = getAccountTierKey(senderName);
+  const tierRange = resolveAmountRangeForTier(sendPolicy, tierKey);
+  const minAmount = Number(tierRange && tierRange.min);
+  const maxAmount = Number(tierRange && tierRange.max);
+  const decimals = clampToNonNegativeInt(tierRange && tierRange.decimals, 3);
+  const spendable = Number(spendableAmount);
+
+  if (!Number.isFinite(spendable) || spendable <= 0 || !Number.isFinite(minAmount) || !Number.isFinite(maxAmount)) {
+    return null;
+  }
+
+  const upperBound = Math.min(maxAmount, spendable);
+  if (!(upperBound >= minAmount)) {
+    return null;
+  }
+
+  return generateRandomCcAmount(
+    {
+      min: minAmount.toFixed(decimals),
+      max: upperBound.toFixed(decimals),
+      decimals
+    },
+    tierKey
+  );
+}
+
+function applyPreferredRecipientOrder(candidateNames, preferredRecipientNames) {
+  const safeCandidates = Array.isArray(candidateNames) ? candidateNames.slice() : [];
+  if (safeCandidates.length === 0) {
+    return [];
+  }
+
+  const preferredIndexByName = new Map();
+  if (Array.isArray(preferredRecipientNames)) {
+    preferredRecipientNames.forEach((name, index) => {
+      const normalized = String(name || "").trim();
+      if (normalized && !preferredIndexByName.has(normalized)) {
+        preferredIndexByName.set(normalized, index);
+      }
+    });
+  }
+
+  if (preferredIndexByName.size === 0) {
+    return safeCandidates;
+  }
+
+  const originalIndexByName = new Map();
+  safeCandidates.forEach((name, index) => {
+    const normalized = String(name || "").trim();
+    if (normalized && !originalIndexByName.has(normalized)) {
+      originalIndexByName.set(normalized, index);
+    }
+  });
+
+  return safeCandidates.sort((left, right) => {
+    const leftName = String(left || "").trim();
+    const rightName = String(right || "").trim();
+    const leftPreferred = preferredIndexByName.has(leftName);
+    const rightPreferred = preferredIndexByName.has(rightName);
+    if (leftPreferred !== rightPreferred) {
+      return leftPreferred ? -1 : 1;
+    }
+    if (leftPreferred && rightPreferred) {
+      return preferredIndexByName.get(leftName) - preferredIndexByName.get(rightName);
+    }
+    return (originalIndexByName.get(leftName) || 0) - (originalIndexByName.get(rightName) || 0);
+  });
+}
+
+function buildInternalFairRoundExecutionPlan(
+  readyEntries,
+  sortedAccounts,
+  accountSnapshots,
+  sendPolicy,
+  sendMode,
+  hybridRoundAssignments = null,
+  holdBufferCc = 0,
+  loopRound = null
+) {
+  const safeReadyEntries = Array.isArray(readyEntries) ? readyEntries.filter((entry) => entry && entry.account) : [];
+  const safeSortedAccounts = Array.isArray(sortedAccounts) ? sortedAccounts.filter((account) => account && account.name) : [];
+  if (safeReadyEntries.length === 0 || safeSortedAccounts.length === 0) {
+    return {
+      entries: safeReadyEntries.slice(),
+      orderLabel: "",
+      summaryLabel: ""
+    };
+  }
+
+  const projectedBalances = new Map();
+  const projectedRecipientLoads = new Map();
+  for (const account of safeSortedAccounts) {
+    const accountName = String(account && account.name ? account.name : "").trim();
+    if (!accountName) {
+      continue;
+    }
+    projectedBalances.set(accountName, getPlanningCcBalance(accountName, accountSnapshots, 0));
+    projectedRecipientLoads.set(accountName, 0);
+  }
+
+  const planningState = safeReadyEntries.map((entry, index) => {
+    const account = entry.account;
+    const accountName = String(account && account.name ? account.name : "").trim();
+    const assignedMode =
+      sendMode === "hybrid"
+        ? (
+            hybridRoundAssignments &&
+            hybridRoundAssignments.externalNames &&
+            hybridRoundAssignments.externalNames.has(accountName)
+              ? "external"
+              : "internal"
+          )
+        : sendMode;
+    return {
+      ...entry,
+      planningBaseIndex: index,
+      assignedMode
+    };
+  });
+
+  const remainingEntries = planningState.slice();
+  const plannedEntries = [];
+  const orderParts = [];
+
+  while (remainingEntries.length > 0) {
+    remainingEntries.sort((left, right) => {
+      const leftName = String(left.account && left.account.name ? left.account.name : "").trim();
+      const rightName = String(right.account && right.account.name ? right.account.name : "").trim();
+      const leftModeRank = left.assignedMode === "internal" ? 0 : (left.assignedMode === "external" ? 1 : 2);
+      const rightModeRank = right.assignedMode === "internal" ? 0 : (right.assignedMode === "external" ? 1 : 2);
+      if (leftModeRank !== rightModeRank) {
+        return leftModeRank - rightModeRank;
+      }
+
+      const leftProjectedBalance = Number(projectedBalances.get(leftName));
+      const rightProjectedBalance = Number(projectedBalances.get(rightName));
+      const leftSpendable = Number.isFinite(leftProjectedBalance) ? leftProjectedBalance - holdBufferCc : Number.NEGATIVE_INFINITY;
+      const rightSpendable = Number.isFinite(rightProjectedBalance) ? rightProjectedBalance - holdBufferCc : Number.NEGATIVE_INFINITY;
+      const leftCanSend = left.assignedMode !== "internal"
+        ? Number.isFinite(leftSpendable) && leftSpendable > 0
+        : leftSpendable >= getTierMinimumAmountForSender(sendPolicy, leftName);
+      const rightCanSend = right.assignedMode !== "internal"
+        ? Number.isFinite(rightSpendable) && rightSpendable > 0
+        : rightSpendable >= getTierMinimumAmountForSender(sendPolicy, rightName);
+      if (leftCanSend !== rightCanSend) {
+        return leftCanSend ? -1 : 1;
+      }
+
+      if (leftSpendable !== rightSpendable) {
+        return rightSpendable - leftSpendable;
+      }
+
+      const leftTx = getPerAccountTxStats(leftName).total;
+      const rightTx = getPerAccountTxStats(rightName).total;
+      if (leftTx !== rightTx) {
+        return leftTx - rightTx;
+      }
+
+      return left.planningBaseIndex - right.planningBaseIndex;
+    });
+
+    const currentEntry = remainingEntries.shift();
+    const senderName = String(currentEntry.account && currentEntry.account.name ? currentEntry.account.name : "").trim();
+    const senderProjectedBalance = Number(projectedBalances.get(senderName));
+    const senderSpendable = Number.isFinite(senderProjectedBalance)
+      ? Math.max(0, senderProjectedBalance - holdBufferCc)
+      : 0;
+    let preferredInternalRecipients = [];
+    let plannedInternalAmount = null;
+    let plannedInternalPrimaryRecipient = "";
+
+    if (currentEntry.assignedMode === "internal") {
+      const internalPlan = buildInternalSendRequests(
+        safeSortedAccounts,
+        senderName,
+        sendPolicy,
+        loopRound,
+        Array.isArray(currentEntry.smartFillBlockRecipients) ? currentEntry.smartFillBlockRecipients : [],
+        [],
+        null,
+        { quiet: true }
+      );
+      const candidateNames = Array.isArray(internalPlan && internalPlan.requests)
+        ? internalPlan.requests.map((request) => String(request && request.label ? request.label : "").trim()).filter((name) => Boolean(name))
+        : [];
+
+      preferredInternalRecipients = buildBalanceAwareRecipientPriority(
+        candidateNames,
+        projectedBalances,
+        projectedRecipientLoads,
+        senderName
+      );
+      plannedInternalAmount = generateTierBalancedAmount(sendPolicy, senderName, senderSpendable);
+      plannedInternalPrimaryRecipient = String(preferredInternalRecipients[0] || "").trim();
+
+      if (plannedInternalPrimaryRecipient && plannedInternalAmount) {
+        const plannedAmountNumeric = Number(plannedInternalAmount);
+        if (Number.isFinite(plannedAmountNumeric)) {
+          if (Number.isFinite(senderProjectedBalance)) {
+            projectedBalances.set(senderName, senderProjectedBalance - plannedAmountNumeric);
+          }
+          const targetProjectedBalance = Number(projectedBalances.get(plannedInternalPrimaryRecipient));
+          if (Number.isFinite(targetProjectedBalance)) {
+            projectedBalances.set(plannedInternalPrimaryRecipient, targetProjectedBalance + plannedAmountNumeric);
+          }
+          projectedRecipientLoads.set(
+            plannedInternalPrimaryRecipient,
+            Number(projectedRecipientLoads.get(plannedInternalPrimaryRecipient) || 0) + 1
+          );
+        }
+      }
+    }
+
+    plannedEntries.push({
+      ...currentEntry,
+      preferredInternalRecipients,
+      plannedInternalAmount,
+      plannedInternalPrimaryRecipient,
+      planningProjectedBalance: senderProjectedBalance,
+      planningSpendable: senderSpendable
+    });
+
+    const summaryParts = [];
+    summaryParts.push(`${senderName}[${currentEntry.assignedMode}]`);
+    if (currentEntry.assignedMode === "internal" && plannedInternalPrimaryRecipient) {
+      summaryParts.push(`-> ${plannedInternalPrimaryRecipient}`);
+    }
+    if (currentEntry.assignedMode === "internal" && plannedInternalAmount) {
+      summaryParts.push(`(${plannedInternalAmount} CC)`);
+    }
+    orderParts.push(summaryParts.join(" "));
+  }
+
+  const totalProjectedBalance = plannedEntries.reduce((sum, entry) => {
+    return sum + (Number.isFinite(entry.planningProjectedBalance) ? entry.planningProjectedBalance : 0);
+  }, 0);
+  const summaryLabel =
+    `planned=${plannedEntries.length} ` +
+    `internal=${plannedEntries.filter((entry) => entry.assignedMode === "internal").length} ` +
+    `external=${plannedEntries.filter((entry) => entry.assignedMode === "external").length} ` +
+    `projectedTotal=${formatRewardsVolumeLabel(totalProjectedBalance)} CC`;
+
+  return {
+    entries: plannedEntries,
+    orderLabel: orderParts.join(" | "),
+    summaryLabel
+  };
+}
+
 function selectHybridRefundTarget(sourceAccount, selectedAccounts, accountSnapshots) {
   const sourceName = String(sourceAccount && sourceAccount.name ? sourceAccount.name : "").trim();
   const candidates = Array.isArray(selectedAccounts)
@@ -3944,7 +4286,9 @@ function buildHybridSendRequests(
   sendPolicy,
   loopRound = null,
   avoidRecipientNames = [],
-  preferredModeInput = null
+  preferredModeInput = null,
+  preferredInternalRecipients = [],
+  plannedInternalAmount = null
 ) {
   const safeRecipients = Array.isArray(recipients) ? recipients : [];
   const internalPlan = buildInternalSendRequests(
@@ -3952,7 +4296,9 @@ function buildHybridSendRequests(
     senderName,
     sendPolicy,
     loopRound,
-    avoidRecipientNames
+    avoidRecipientNames,
+    preferredInternalRecipients,
+    plannedInternalAmount
   );
   const hasInternalRoute = Array.isArray(internalPlan && internalPlan.requests) && internalPlan.requests.length > 0;
   const hasExternalRoute = safeRecipients.length > 0;
@@ -6872,6 +7218,42 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
       }
 
       if (!Number.isFinite(availableAmount) || availableAmount < requiredWithBuffer) {
+        const maxSendableAmount = Number.isFinite(availableAmount)
+          ? Math.max(0, availableAmount - BALANCE_GUARD_MIN_BUFFER_CC)
+          : 0;
+        const reducedAmount = senderAccountName
+          ? generateTierBalancedAmount(config.send, senderAccountName, maxSendableAmount)
+          : null;
+
+        if (
+          reducedAmount &&
+          Number.isFinite(Number(reducedAmount)) &&
+          Number(reducedAmount) > 0 &&
+          Number(reducedAmount) < requiredAmount
+        ) {
+          const previousAmount = sendRequest.amount;
+          sendRequest.amount = reducedAmount;
+
+          if (recipientCandidateMode) {
+            for (let candidateIndex = index; candidateIndex < sendRequests.length; candidateIndex += 1) {
+              sendRequests[candidateIndex].amount = reducedAmount;
+            }
+          }
+
+          console.log(
+            `[info] Auto-reduced tx ${progress} amount ${previousAmount} -> ${reducedAmount} ` +
+            `to stay within current balance ${availableAmount} CC ` +
+            `(+hold ${BALANCE_GUARD_MIN_BUFFER_CC})`
+          );
+          dashboard.setState({
+            phase: "send",
+            swapsTotal: progressForDashboard,
+            swapsOk: String(completedTx),
+            swapsFail: String(skippedTx),
+            transfer: `adjust-amount (${progress})`,
+            send: `${reducedAmount} CC -> ${sendRequest.label} (tier-safe reduce)`
+          });
+        } else {
         const retryAfterSeconds = TX_RETRY_INITIAL_DELAY_SECONDS;
         console.log(
           `[warn] Deferring tx ${progress} due insufficient balance: ` +
@@ -6897,6 +7279,7 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
           sendLabel: `${sendRequest.amount} CC -> ${sendRequest.label}`
         };
         break;
+        }
       }
     } else {
       // Balance check is required to avoid useless transfer timeouts when funds are not ready.
@@ -8074,7 +8457,9 @@ async function processAccount(context) {
     deferWalleyRefundsToRoundLevel,
     maxLoopTxOverride,
     smartFillBlockRecipients,
-    resumeFromDeferReason
+    resumeFromDeferReason,
+    preferredInternalRecipients,
+    plannedInternalAmount
   } = context;
   const safeSmartFillBlockRecipients = Array.isArray(smartFillBlockRecipients)
     ? smartFillBlockRecipients
@@ -8269,7 +8654,9 @@ async function processAccount(context) {
         sendPolicy,
         currentRound,
         safeSmartFillBlockRecipients,
-        hybridAssignedMode
+        hybridAssignedMode,
+        Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
+        plannedInternalAmount || null
       );
 
       if (hybridPlan.selectedMode === "internal" && safeSmartFillBlockRecipients.length > 0) {
@@ -8353,7 +8740,9 @@ async function processAccount(context) {
         account.name,
         sendPolicy,
         currentRound,
-        safeSmartFillBlockRecipients
+        safeSmartFillBlockRecipients,
+        Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
+        plannedInternalAmount || null
       );
 
       if (safeSmartFillBlockRecipients.length > 0) {
@@ -9351,6 +9740,38 @@ async function runDailyCycle(context) {
         );
       }
 
+      let executionEntries = readyEntries;
+      if ((sendMode === "internal" || sendMode === "hybrid") && readyEntries.length > 0) {
+        const holdBufferCc = Math.max(
+          0,
+          Number(
+            isObject(config && config.safety)
+              ? config.safety.minHoldBalanceCc
+              : INTERNAL_API_DEFAULTS.safety.minHoldBalanceCc
+          ) || 0
+        );
+        const fairExecutionPlan = buildInternalFairRoundExecutionPlan(
+          readyEntries,
+          sortedAccounts,
+          accountSnapshots,
+          config.send,
+          sendMode,
+          hybridRoundAssignments,
+          holdBufferCc,
+          loopRound
+        );
+        if (fairExecutionPlan && Array.isArray(fairExecutionPlan.entries) && fairExecutionPlan.entries.length > 0) {
+          executionEntries = fairExecutionPlan.entries;
+          const orderedAccountsLabel = executionEntries.map((entry) => entry.account.name).join(" -> ");
+          console.log(
+            `[internal-plan] Round ${loopRound}/${totalLoopRounds}: ${fairExecutionPlan.summaryLabel}`
+          );
+          console.log(
+            `[internal-plan] Round ${loopRound}/${totalLoopRounds} order: ${orderedAccountsLabel}`
+          );
+        }
+      }
+
       // ========================================================================
       // EXECUTION MODE: Sequential for Round 1, Parallel for Round 2+
       // ========================================================================
@@ -9362,16 +9783,16 @@ async function runDailyCycle(context) {
         // SEQUENTIAL EXECUTION (Round 1): Process accounts one by one
         // This allows proper OTP input without prompts overlapping
         // ====================================================================
-        const sequentialAccounts = readyEntries.map((e) => e.account.name).join(" -> ");
-        console.log(`[sequential] Processing ${readyEntries.length} accounts one by one: ${sequentialAccounts}`);
+        const sequentialAccounts = executionEntries.map((e) => e.account.name).join(" -> ");
+        console.log(`[sequential] Processing ${executionEntries.length} accounts one by one: ${sequentialAccounts}`);
         
-        for (let i = 0; i < readyEntries.length; i++) {
-          const entry = readyEntries[i];
+        for (let i = 0; i < executionEntries.length; i++) {
+          const entry = executionEntries[i];
           const account = entry.account;
           const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
           tokens.accounts[account.name] = accountToken;
 
-          console.log(`[sequential] [${i + 1}/${readyEntries.length}] Processing ${account.name}...`);
+          console.log(`[sequential] [${i + 1}/${executionEntries.length}] Processing ${account.name}...`);
 
           try {
             const result = await processAccount({
@@ -9400,7 +9821,11 @@ async function runDailyCycle(context) {
               smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
                 ? entry.smartFillBlockRecipients
                 : [],
-              resumeFromDeferReason: entry.deferReason || ""
+              resumeFromDeferReason: entry.deferReason || "",
+              preferredInternalRecipients: Array.isArray(entry.preferredInternalRecipients)
+                ? entry.preferredInternalRecipients
+                : [],
+              plannedInternalAmount: entry.plannedInternalAmount || null
             });
             roundResults.push({ entry, result, error: null });
           } catch (error) {
@@ -9439,7 +9864,7 @@ async function runDailyCycle(context) {
           }
 
           // Small delay between sequential accounts (not the full jitter)
-          if (i < readyEntries.length - 1 && !args.dryRun) {
+          if (i < executionEntries.length - 1 && !args.dryRun) {
             const seqDelaySec = 2; // 2 seconds between sequential accounts
             console.log(`[sequential] Waiting ${seqDelaySec}s before next account...`);
             await sleep(seqDelaySec * 1000);
@@ -9450,10 +9875,10 @@ async function runDailyCycle(context) {
         // PARALLEL EXECUTION (Round 2+): All accounts send with staggered jitter
         // Sessions should already be established from Round 1
         // ====================================================================
-        const parallelAccounts = readyEntries.map((e) => e.account.name).join(", ");
-        console.log(`[parallel] Executing ${readyEntries.length} accounts with jitter ${parallelJitterMinSec}-${parallelJitterMaxSec}s: ${parallelAccounts}`);
+        const parallelAccounts = executionEntries.map((e) => e.account.name).join(", ");
+        console.log(`[parallel] Executing ${executionEntries.length} accounts with jitter ${parallelJitterMinSec}-${parallelJitterMaxSec}s: ${parallelAccounts}`);
         
-        const accountPromises = readyEntries.map(async (entry, i) => {
+        const accountPromises = executionEntries.map(async (entry, i) => {
           const account = entry.account;
           const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
           tokens.accounts[account.name] = accountToken;
@@ -9494,7 +9919,11 @@ async function runDailyCycle(context) {
               smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
                 ? entry.smartFillBlockRecipients
                 : [],
-              resumeFromDeferReason: entry.deferReason || ""
+              resumeFromDeferReason: entry.deferReason || "",
+              preferredInternalRecipients: Array.isArray(entry.preferredInternalRecipients)
+                ? entry.preferredInternalRecipients
+                : [],
+              plannedInternalAmount: entry.plannedInternalAmount || null
             });
             return { entry, result, error: null };
           } catch (error) {
