@@ -900,11 +900,48 @@ function buildInternalSendRequests(
 let globalSwapsTotal = 0;
 let globalSwapsOk = 0;
 let globalSwapsFail = 0;
+let txStatsUtcDayKey = "";
 
 // Per-account TX tracking - accumulates totals per account for TX Progress column
 const perAccountTxStats = {};
 
+function getCurrentUTCDayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function ensureTxStatsCurrentUtcDay() {
+  const currentDayKey = getCurrentUTCDayKey();
+  if (!txStatsUtcDayKey) {
+    txStatsUtcDayKey = currentDayKey;
+    return false;
+  }
+
+  if (txStatsUtcDayKey === currentDayKey) {
+    return false;
+  }
+
+  txStatsUtcDayKey = currentDayKey;
+  globalSwapsTotal = 0;
+  globalSwapsOk = 0;
+  globalSwapsFail = 0;
+  for (const key of Object.keys(perAccountTxStats)) {
+    delete perAccountTxStats[key];
+  }
+  console.log(`[tx-progress] Reset daily TX counters for new UTC day: ${currentDayKey}`);
+  return true;
+}
+
+function getGlobalTxStatsSnapshot() {
+  ensureTxStatsCurrentUtcDay();
+  return {
+    total: globalSwapsTotal,
+    ok: globalSwapsOk,
+    fail: globalSwapsFail
+  };
+}
+
 function resetGlobalTxStats() {
+  txStatsUtcDayKey = getCurrentUTCDayKey();
   globalSwapsTotal = 0;
   globalSwapsOk = 0;
   globalSwapsFail = 0;
@@ -915,12 +952,14 @@ function resetGlobalTxStats() {
 }
 
 function addGlobalTxStats(completed, failed) {
+  ensureTxStatsCurrentUtcDay();
   globalSwapsTotal += completed + failed;
   globalSwapsOk += completed;
   globalSwapsFail += failed;
 }
 
 function addPerAccountTxStats(accountName, completed, failed) {
+  ensureTxStatsCurrentUtcDay();
   if (!perAccountTxStats[accountName]) {
     perAccountTxStats[accountName] = { total: 0, ok: 0, fail: 0 };
   }
@@ -930,6 +969,7 @@ function addPerAccountTxStats(accountName, completed, failed) {
 }
 
 function getPerAccountTxStats(accountName) {
+  ensureTxStatsCurrentUtcDay();
   return perAccountTxStats[accountName] || { total: 0, ok: 0, fail: 0 };
 }
 
@@ -1750,14 +1790,18 @@ class PinnedDashboard {
     return escapeHtml(String(value || "").replace(/\r?\n/g, " "));
   }
 
-  buildRewardSummaryLabel(quality, tier, todayPoints, volume, dailyCheckin) {
+  buildRewardSummaryLabel(reward, quality, tier, todayPoints, volume, dailyCheckin) {
     const parts = [];
+    const rewardValue = String(reward || "-").trim();
     const qualityValue = String(quality || "-").trim();
     const tierValue = String(tier || "-").trim();
     const todayPointsValue = String(todayPoints || "-").trim();
     const volumeValue = String(volume || "-").trim();
     const dailyCheckinValue = String(dailyCheckin || "-").trim();
 
+    if (rewardValue && rewardValue !== "-") {
+      parts.push(rewardValue);
+    }
     if (tierValue && tierValue !== "-") {
       parts.push(`Tier ${tierValue}`);
     }
@@ -1891,7 +1935,7 @@ class PinnedDashboard {
         cc: isSelected
           ? (balances.cc !== "-" ? balances.cc : String(snapshot.cc || "-"))
           : String(snapshot.cc || "-"),
-        progress: isSelected ? currentProgress : String(snapshot.progress || "-"),
+        progress: currentProgress,
         send: isSelected
           ? (String(this.state.send || "-") !== "-" ? String(this.state.send || "-") : String(snapshot.send || "-"))
           : String(snapshot.send || "-"),
@@ -1955,6 +1999,7 @@ class PinnedDashboard {
 
     for (const row of rows) {
       row.rewardSummary = this.buildRewardSummaryLabel(
+        row.reward,
         row.rewardQuality,
         row.rewardTier,
         row.rewardTodayPoints,
@@ -1973,6 +2018,7 @@ class PinnedDashboard {
     const progress = String(row && row.progress ? row.progress : "-").trim() || "-";
     const send = String(row && row.send ? row.send : "-").trim() || "-";
     const rewardSummary = this.buildRewardSummaryLabel(
+      row && row.reward,
       row && row.rewardQuality,
       row && row.rewardTier,
       row && row.rewardTodayPoints,
@@ -1990,6 +2036,9 @@ class PinnedDashboard {
     }
 
     const rewardParts = [];
+    if (row && row.reward && row.reward !== "-") {
+      rewardParts.push(`${escapeHtml(row.reward)}`);
+    }
     if (row && row.rewardTier && row.rewardTier !== "-") {
       rewardParts.push(`Tier ${escapeHtml(row.rewardTier)}`);
     }
@@ -2020,6 +2069,7 @@ class PinnedDashboard {
   }
 
   buildTelegramSelectedRewardsLines() {
+    const reward = String(this.state.reward || "-").trim();
     const tier = String(this.state.rewardTier || "-").trim();
     const quality = String(this.state.rewardQuality || "-").trim();
     const todayPoints = String(this.state.rewardTodayPoints || "-").trim();
@@ -2030,6 +2080,9 @@ class PinnedDashboard {
     const primaryParts = [];
     const secondaryParts = [];
 
+    if (reward && reward !== "-") {
+      primaryParts.push(reward);
+    }
     if (tier && tier !== "-") {
       primaryParts.push(`Tier ${tier}`);
     }
@@ -2061,11 +2114,14 @@ class PinnedDashboard {
     const rows = this.parseAccountRows();
     const modeLabel = String(this.state.mode || "-").toUpperCase();
     const selectedAccount = this.parseSelectedAccountName() || "-";
+    const reward = String(this.state.reward || "-").trim();
     const tier = String(this.state.rewardTier || "-").trim();
     const quality = String(this.state.rewardQuality || "-").trim();
     const todayPoints = String(this.state.rewardTodayPoints || "-").trim();
     const volume = String(this.state.rewardVolume || "-").trim();
     const dailyCheckin = String(this.state.rewardDailyCheckin || "-").trim();
+    const txStats = getGlobalTxStatsSnapshot();
+    const txProgressLabel = `${txStats.total}/${txStats.total}`;
     const shownAccountCount = Math.min(
       rows.length,
       Math.max(
@@ -2079,10 +2135,13 @@ class PinnedDashboard {
       `🕒 Time  <code>${this.escapeTelegramCode(`${getJakartaTimeStamp()} WIB`)}</code>`,
       `🚦 Run   <b>${escapeHtml(modeLabel)}</b> | ${escapeHtml(String(this.state.phase || "-"))}`,
       `👤 Acct  <b>${escapeHtml(selectedAccount)}</b> | <code>${this.escapeTelegramCode(`${shownAccountCount}/${rows.length || 0}`)}</code> shown`,
-      `📊 TX    <code>${this.escapeTelegramCode(String(this.state.swapsTotal || "0/0"))}</code> | ok <code>${this.escapeTelegramCode(String(this.state.swapsOk || "0"))}</code> | fail <code>${this.escapeTelegramCode(String(this.state.swapsFail || "0"))}</code> | target <code>${this.escapeTelegramCode(`${this.state.targetPerDay}/day`)}</code>`
+      `📊 TX    <code>${this.escapeTelegramCode(txProgressLabel)}</code> | ok <code>${this.escapeTelegramCode(String(txStats.ok))}</code> | fail <code>${this.escapeTelegramCode(String(txStats.fail))}</code> | target <code>${this.escapeTelegramCode(`${this.state.targetPerDay}/day`)}</code>`
     ];
 
     const rewardPrimaryParts = [];
+    if (reward && reward !== "-") {
+      rewardPrimaryParts.push(`<code>${this.escapeTelegramCode(reward)}</code>`);
+    }
     if (tier && tier !== "-") {
       rewardPrimaryParts.push(`Tier ${escapeHtml(tier)}`);
     }
@@ -2126,6 +2185,9 @@ class PinnedDashboard {
     }
 
     const rewardParts = [];
+    if (row && row.reward && row.reward !== "-") {
+      rewardParts.push(`<code>${this.escapeTelegramCode(row.reward)}</code>`);
+    }
     if (row && row.rewardTier && row.rewardTier !== "-") {
       rewardParts.push(`Tier ${row.rewardTier}`);
     }
@@ -2211,13 +2273,15 @@ class PinnedDashboard {
     );
     const modeLabel = String(this.state.mode || "-").toUpperCase();
     const selectedAccount = this.parseSelectedAccountName() || "-";
+    const txStats = getGlobalTxStatsSnapshot();
+    const txProgressLabel = `${txStats.total}/${txStats.total}`;
     const shownAccountCount = Math.min(rows.length, accountLimit);
 
     const lines = [
       `Time  ${now} WIB`,
       `Run   ${modeLabel} | ${this.state.phase}`,
       `Acct  ${selectedAccount} | ${shownAccountCount}/${rows.length || 0} shown`,
-      `TX    ${this.state.swapsTotal} | ok ${this.state.swapsOk} | fail ${this.state.swapsFail} | target ${this.state.targetPerDay}/day`
+      `TX    ${txProgressLabel} | ok ${txStats.ok} | fail ${txStats.fail} | target ${this.state.targetPerDay}/day`
     ];
 
     const selectedRewardLines = this.buildTelegramSelectedRewardsLines();
@@ -2267,6 +2331,7 @@ class PinnedDashboard {
       const frameWidth = Math.max(118, Math.min(170, terminalWidth));
       const contentWidth = frameWidth - 4;
       const modeLabel = String(this.state.mode || "-").toUpperCase();
+      const txStats = getGlobalTxStatsSnapshot();
       const topBorder = `+${"=".repeat(frameWidth - 2)}+`;
       const midBorder = `+${"-".repeat(frameWidth - 2)}+`;
       const bannerLine = (text) => `| ${this.formatCell(text, contentWidth)} |`;
@@ -2295,7 +2360,7 @@ class PinnedDashboard {
       );
       lines.push(
         bannerLine(
-          `Sends: ${this.state.swapsTotal} total  ${this.state.swapsOk} ok  ${this.state.swapsFail} fail  |  Target: ${this.state.targetPerDay}/day`
+          `Sends: ${txStats.total}/${txStats.total} total  ${txStats.ok} ok  ${txStats.fail} fail  |  Target: ${this.state.targetPerDay}/day`
         )
       );
       lines.push(
@@ -2304,7 +2369,7 @@ class PinnedDashboard {
         )
       );
       lines.push(midBorder);
-      lines.push(tableRow(["Akun", "Status", "CC", "TX Progress", "Send Plan", "Tier / Q / Today / Vol / Check-in"]));
+      lines.push(tableRow(["Akun", "Status", "CC", "TX Progress", "Send Plan", "Reward / Tier / Q / Today / Vol / Check-in"]));
       lines.push(tableRule("-"));
 
       if (rows.length === 0) {
@@ -5922,14 +5987,22 @@ function extractThisWeekRewardLabelFromResponse(payload) {
   const data = isObject(payload && payload.data) ? payload.data : {};
   const candidates = [];
 
-  candidates.push(data.earnedThisWeekCc, data.thisWeekCc, data.rewardThisWeekCc);
+  candidates.push(
+    data.earnedThisWeekCc,
+    data.thisWeekCc,
+    data.rewardThisWeekCc,
+    data.rewardsThisWeekCc,
+    data.rewardsThisWeek
+  );
 
   if (isObject(data.tierProgress)) {
     candidates.push(
       data.tierProgress.earnedThisWeekCc,
       data.tierProgress.thisWeekRewardCc,
       data.tierProgress.rewardThisWeekCc,
-      data.tierProgress.thisWeekCc
+      data.tierProgress.thisWeekCc,
+      data.tierProgress.rewardsThisWeekCc,
+      data.tierProgress.rewardsThisWeek
     );
   }
 
@@ -6093,6 +6166,7 @@ function extractRewardsInsightsFromResponse(payload) {
 }
 
 async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag = null, accountName = null, minScoreThreshold = null) {
+  let rewardLabel = "-";
   let qualityLabel = "-";
   let tierLabel = "-";
   let todayPointsLabel = "-";
@@ -6102,6 +6176,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
 
   try {
     const overviewResponse = await client.getRewardsOverview();
+    rewardLabel = extractThisWeekRewardLabelFromResponse(overviewResponse);
     const insights = extractRewardsInsightsFromResponse(overviewResponse);
     qualityLabel = insights.quality;
     tierLabel = insights.tier;
@@ -6144,6 +6219,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
   }
 
   if (
+    rewardLabel !== "-" ||
     qualityLabel !== "-" ||
     tierLabel !== "-" ||
     todayPointsLabel !== "-" ||
@@ -6151,7 +6227,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
     dailyCheckinLabel !== "-"
   ) {
     const summaryLabel = buildRewardsSummaryLabel(
-      "-",
+      rewardLabel,
       qualityLabel,
       tierLabel,
       todayPointsLabel,
@@ -6159,7 +6235,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
       dailyCheckinLabel
     );
     dashboard.setState({
-      reward: "-",
+      reward: rewardLabel,
       rewardQuality: qualityLabel,
       rewardTier: tierLabel,
       rewardTodayPoints: todayPointsLabel,
@@ -6170,6 +6246,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
   }
   // Don't log warning for timeout - just silently skip
   return {
+    reward: rewardLabel,
     quality: qualityLabel,
     tier: tierLabel,
     todayPoints: todayPointsLabel,
