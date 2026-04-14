@@ -7,6 +7,33 @@
     "parallelJitterMaxSeconds": 10,
     "delayCycleSeconds": 3000,
     "sequentialAllRounds": true,
+    "tierAmounts": {
+      "unranked": {
+        "min": "25",
+        "max": "50",
+        "decimals": 3
+      },
+      "newbie": {
+        "min": "25",
+        "max": "50",
+        "decimals": 3
+      },
+      "advanced": {
+        "min": "50",
+        "max": "100",
+        "decimals": 3
+      },
+      "pro": {
+        "min": "75",
+        "max": "150",
+        "decimals": 3
+      },
+      "elite": {
+        "min": "150",
+        "max": "300",
+        "decimals": 3
+      }
+    },
     "randomAmount": {
       "enabled": true,
       "min": "30",

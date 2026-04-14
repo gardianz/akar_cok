@@ -752,7 +752,7 @@ function buildInternalSendRequests(
   }
 
   cleanupExpiredSendPairs();
-  const amount = generateRandomCcAmount(sendPolicy.randomAmount);
+  const amount = generateRandomCcAmount(sendPolicy, getAccountTierKey(senderName));
   let requests = [];
   let shortestBlockedCooldownSeconds = 0;
   let skippedByAvoidCount = 0;
@@ -1283,6 +1283,13 @@ const INTERNAL_API_DEFAULTS = {
     parallelJitterMaxSeconds: 15,
     delayCycleSeconds: 300,
     sequentialAllRounds: true,
+    tierAmounts: {
+      unranked: { min: "25", max: "50", decimals: 3 },
+      newbie: { min: "25", max: "50", decimals: 3 },
+      advanced: { min: "50", max: "100", decimals: 3 },
+      pro: { min: "75", max: "150", decimals: 3 },
+      elite: { min: "150", max: "300", decimals: 3 }
+    },
     randomAmount: {
       enabled: false,
       min: "0.10",
@@ -2068,6 +2075,40 @@ class PinnedDashboard {
     };
   }
 
+  parseCcNumeric(value) {
+    const text = String(value || "").trim();
+    if (!text || text === "-") {
+      return null;
+    }
+
+    const match = text.match(/-?\d+(?:\.\d+)?/);
+    if (!match) {
+      return null;
+    }
+
+    const numeric = Number(match[0]);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  getAggregateCcBalanceSummary(rows = []) {
+    let total = 0;
+    let count = 0;
+
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const numeric = this.parseCcNumeric(row && row.cc);
+      if (!Number.isFinite(numeric)) {
+        continue;
+      }
+      total += numeric;
+      count += 1;
+    }
+
+    return {
+      total: count > 0 ? total : null,
+      count
+    };
+  }
+
   syncSelectedAccountSnapshot() {
     const selected = this.parseSelectedAccountName();
     if (!selected || selected === "-") {
@@ -2361,6 +2402,7 @@ class PinnedDashboard {
     const txProgressLabel = `${txStats.total}/${txStats.total}`;
     const rewardsTotals = getTotalRewardsThisWeek();
     const rewardsDiffTotals = getTotalRewardsDiff();
+    const aggregateBalance = this.getAggregateCcBalanceSummary(rows);
     const shownAccountCount = Math.min(
       rows.length,
       Math.max(
@@ -2376,6 +2418,12 @@ class PinnedDashboard {
       `👤 Acct  <b>${escapeHtml(selectedAccount)}</b> | <code>${this.escapeTelegramCode(`${shownAccountCount}/${rows.length || 0}`)}</code> shown`,
       `📊 TX    <code>${this.escapeTelegramCode(txProgressLabel)}</code> | ok <code>${this.escapeTelegramCode(String(txStats.ok))}</code> | fail <code>${this.escapeTelegramCode(String(txStats.fail))}</code> | target <code>${this.escapeTelegramCode(`${this.state.targetPerDay}/day`)}</code>`
     ];
+
+    if (Number.isFinite(aggregateBalance.total)) {
+      lines.push(
+        `🏦 Total CC <code>${this.escapeTelegramCode(aggregateBalance.total.toFixed(4))}</code> | acct <code>${this.escapeTelegramCode(String(aggregateBalance.count))}</code>`
+      );
+    }
 
     const rewardPrimaryParts = [];
     if (reward && reward !== "-") {
@@ -2555,6 +2603,7 @@ class PinnedDashboard {
     const txProgressLabel = `${txStats.total}/${txStats.total}`;
     const rewardsTotals = getTotalRewardsThisWeek();
     const rewardsDiffTotals = getTotalRewardsDiff();
+    const aggregateBalance = this.getAggregateCcBalanceSummary(rows);
     const shownAccountCount = Math.min(rows.length, accountLimit);
 
     const lines = [
@@ -2563,6 +2612,10 @@ class PinnedDashboard {
       `Acct  ${selectedAccount} | ${shownAccountCount}/${rows.length || 0} shown`,
       `TX    ${txProgressLabel} | ok ${txStats.ok} | fail ${txStats.fail} | target ${this.state.targetPerDay}/day`
     ];
+
+    if (Number.isFinite(aggregateBalance.total)) {
+      lines.push(`Total CC ${aggregateBalance.total.toFixed(4)} | acct ${aggregateBalance.count}`);
+    }
 
     const selectedRewardLines = this.buildTelegramSelectedRewardsLines();
     if (selectedRewardLines.length > 0) {
@@ -2626,6 +2679,7 @@ class PinnedDashboard {
       const contentWidth = frameWidth - 4;
       const modeLabel = String(this.state.mode || "-").toUpperCase();
       const txStats = getGlobalTxStatsSnapshot();
+      const aggregateBalance = this.getAggregateCcBalanceSummary(rows);
       const topBorder = `+${"=".repeat(frameWidth - 2)}+`;
       const midBorder = `+${"-".repeat(frameWidth - 2)}+`;
       const bannerLine = (text) => `| ${this.formatCell(text, contentWidth)} |`;
@@ -2660,6 +2714,13 @@ class PinnedDashboard {
           `Sends: ${txStats.total}/${txStats.total} total  ${txStats.ok} ok  ${txStats.fail} fail  |  Target: ${this.state.targetPerDay}/day`
         )
       );
+      if (Number.isFinite(aggregateBalance.total)) {
+        lines.push(
+          bannerLine(
+            `Total balance (all accounts): ${aggregateBalance.total.toFixed(4)} CC  |  Accounts with balance: ${aggregateBalance.count}/${accountCount}`
+          )
+        );
+      }
       if (Number.isFinite(rewardsTotals.cc) || Number.isFinite(rewardsTotals.usd)) {
         const totalCcLabel = Number.isFinite(rewardsTotals.cc) ? `${rewardsTotals.cc.toFixed(2)} CC` : "?";
         const totalUsdLabel = Number.isFinite(rewardsTotals.usd) ? `$${rewardsTotals.usd.toFixed(2)}` : "?";
@@ -3275,6 +3336,9 @@ function cloneRuntimeConfig(config) {
     session: { ...config.session },
     send: {
       ...config.send,
+      tierAmounts: {
+        ...(isObject(config.send && config.send.tierAmounts) ? config.send.tierAmounts : {})
+      },
       randomAmount: {
         ...(isObject(config.send && config.send.randomAmount) ? config.send.randomAmount : {})
       }
@@ -3451,6 +3515,22 @@ function normalizeCcAmount(rawAmount) {
   return text;
 }
 
+const TIER_KEYS = ["unranked", "newbie", "advanced", "pro", "elite"];
+const tierDisplayNameByAccount = new Map();
+
+function resolveTierKey(tierDisplayName) {
+  const key = String(tierDisplayName || "").trim().toLowerCase();
+  return TIER_KEYS.includes(key) ? key : "unranked";
+}
+
+function getAccountTierKey(accountName) {
+  const normalizedName = String(accountName || "").trim();
+  if (!normalizedName) {
+    return "unranked";
+  }
+  return resolveTierKey(tierDisplayNameByAccount.get(normalizedName));
+}
+
 function normalizeRandomAmountConfig(rawRandomAmount, fallback, pathLabel) {
   const base = isObject(fallback) ? fallback : INTERNAL_API_DEFAULTS.send.randomAmount;
   const input = isObject(rawRandomAmount) ? rawRandomAmount : {};
@@ -3487,14 +3567,72 @@ function normalizeRandomAmountConfig(rawRandomAmount, fallback, pathLabel) {
   };
 }
 
-function generateRandomCcAmount(randomAmountConfig) {
-  const decimals = clampToNonNegativeInt(randomAmountConfig.decimals, 2);
+function normalizeTierAmountsConfig(rawTierAmounts, fallback, pathLabel) {
+  const defaults = isObject(fallback) ? fallback : INTERNAL_API_DEFAULTS.send.tierAmounts;
+  const input = isObject(rawTierAmounts) ? rawTierAmounts : {};
+  const result = {};
+
+  for (const key of TIER_KEYS) {
+    const tierInput = isObject(input[key]) ? input[key] : {};
+    const tierDefault = isObject(defaults[key]) ? defaults[key] : defaults.unranked;
+    const min = normalizeCcAmount(
+      Object.prototype.hasOwnProperty.call(tierInput, "min") ? tierInput.min : tierDefault.min
+    );
+    const max = normalizeCcAmount(
+      Object.prototype.hasOwnProperty.call(tierInput, "max") ? tierInput.max : tierDefault.max
+    );
+    const decimals = clampToNonNegativeInt(
+      tierInput.decimals,
+      clampToNonNegativeInt(tierDefault.decimals, 3)
+    );
+
+    if (decimals > 8) {
+      throw new Error(`${pathLabel}.${key}.decimals must be <= 8`);
+    }
+    if (Number(min) > Number(max)) {
+      throw new Error(`${pathLabel}.${key}.min must be <= ${pathLabel}.${key}.max`);
+    }
+
+    result[key] = { min, max, decimals };
+  }
+
+  return result;
+}
+
+function resolveAmountRangeForTier(sendPolicyOrRange, tierKey) {
+  if (!isObject(sendPolicyOrRange)) {
+    return INTERNAL_API_DEFAULTS.send.randomAmount;
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(sendPolicyOrRange, "min") &&
+    Object.prototype.hasOwnProperty.call(sendPolicyOrRange, "max")
+  ) {
+    return sendPolicyOrRange;
+  }
+
+  const normalizedTierKey = resolveTierKey(tierKey);
+  const tierAmounts = isObject(sendPolicyOrRange.tierAmounts) ? sendPolicyOrRange.tierAmounts : null;
+  if (tierAmounts && isObject(tierAmounts[normalizedTierKey])) {
+    return tierAmounts[normalizedTierKey];
+  }
+
+  if (isObject(sendPolicyOrRange.randomAmount)) {
+    return sendPolicyOrRange.randomAmount;
+  }
+
+  return INTERNAL_API_DEFAULTS.send.randomAmount;
+}
+
+function generateRandomCcAmount(sendPolicyOrRange, tierKey = null) {
+  const amountRange = resolveAmountRangeForTier(sendPolicyOrRange, tierKey);
+  const decimals = clampToNonNegativeInt(amountRange.decimals, 2);
   const factor = Math.pow(10, decimals);
-  const minUnits = Math.ceil(Number(randomAmountConfig.min) * factor);
-  const maxUnits = Math.floor(Number(randomAmountConfig.max) * factor);
+  const minUnits = Math.ceil(Number(amountRange.min) * factor);
+  const maxUnits = Math.floor(Number(amountRange.max) * factor);
 
   if (minUnits <= 0 || maxUnits <= 0 || minUnits > maxUnits) {
-    throw new Error("Random amount range is invalid. Check config.send.randomAmount settings.");
+    throw new Error("Random amount range is invalid. Check config.send.randomAmount or config.send.tierAmounts settings.");
   }
 
   const units = randomIntInclusive(minUnits, maxUnits);
@@ -3502,12 +3640,13 @@ function generateRandomCcAmount(randomAmountConfig) {
   return normalizeCcAmount(amount);
 }
 
-function buildSendRequestsWithRandomRecipients(recipients, sendPolicy) {
+function buildSendRequestsWithRandomRecipients(recipients, sendPolicy, senderName = null) {
   const requests = [];
   const txCount = clampToNonNegativeInt(sendPolicy.maxLoopTx || sendPolicy.maxTx, 1);
+  const senderTierKey = getAccountTierKey(senderName);
 
   for (let index = 0; index < txCount; index += 1) {
-    const amount = generateRandomCcAmount(sendPolicy.randomAmount);
+    const amount = generateRandomCcAmount(sendPolicy, senderTierKey);
     const target = getRandomRecipient(recipients);
 
     requests.push({
@@ -3521,8 +3660,8 @@ function buildSendRequestsWithRandomRecipients(recipients, sendPolicy) {
   return requests;
 }
 
-function buildSingleExternalRandomRequest(recipients, sendPolicy, source = "external-random") {
-  const amount = generateRandomCcAmount(sendPolicy.randomAmount);
+function buildSingleExternalRandomRequest(recipients, sendPolicy, source = "external-random", senderName = null) {
+  const amount = generateRandomCcAmount(sendPolicy, getAccountTierKey(senderName));
   const target = getRandomRecipient(recipients);
 
   return {
@@ -3533,8 +3672,8 @@ function buildSingleExternalRandomRequest(recipients, sendPolicy, source = "exte
   };
 }
 
-function buildHybridExternalRequest(recipients, sendPolicy, refundTargetAccount) {
-  const request = buildSingleExternalRandomRequest(recipients, sendPolicy, "hybrid-external-random");
+function buildHybridExternalRequest(recipients, sendPolicy, refundTargetAccount, senderName = null) {
+  const request = buildSingleExternalRandomRequest(recipients, sendPolicy, "hybrid-external-random", senderName);
   if (refundTargetAccount && String(refundTargetAccount.address || "").trim()) {
     request.refundTargetAlias = String(refundTargetAccount.name || "").trim();
     request.refundTargetPartyId = String(refundTargetAccount.address || "").trim();
@@ -3568,14 +3707,15 @@ function buildInternalRecipients(accounts, currentAccountName) {
   return recipients;
 }
 
-function buildSendRequests(target, sendPolicy, fixedAmountInput, idempotencySeed) {
+function buildSendRequests(target, sendPolicy, fixedAmountInput, idempotencySeed, senderName = null) {
   const requests = [];
   const txCount = clampToNonNegativeInt(sendPolicy.maxLoopTx || sendPolicy.maxTx, 1);
+  const senderTierKey = getAccountTierKey(senderName);
 
   for (let index = 0; index < txCount; index += 1) {
     const amount = fixedAmountInput
       ? normalizeCcAmount(fixedAmountInput)
-      : generateRandomCcAmount(sendPolicy.randomAmount);
+      : generateRandomCcAmount(sendPolicy, senderTierKey);
 
     let idempotencyKey = null;
     if (idempotencySeed) {
@@ -3853,7 +3993,7 @@ function buildHybridSendRequests(
   if (preferredMode === "external" && hasExternalRoute) {
     return {
       selectedMode: "external",
-      requests: [buildSingleExternalRandomRequest(safeRecipients, sendPolicy, "hybrid-external-random")],
+      requests: [buildSingleExternalRandomRequest(safeRecipients, sendPolicy, "hybrid-external-random", senderName)],
       reason: null,
       retryAfterSeconds: 0,
       primaryOffset: 0,
@@ -3874,7 +4014,7 @@ function buildHybridSendRequests(
 
   return {
     selectedMode: "external",
-    requests: [buildSingleExternalRandomRequest(safeRecipients, sendPolicy, "hybrid-external-random")],
+    requests: [buildSingleExternalRandomRequest(safeRecipients, sendPolicy, "hybrid-external-random", senderName)],
     reason: null,
     retryAfterSeconds: 0,
     primaryOffset: 0,
@@ -4096,21 +4236,20 @@ function getReducedAmountForFragmentedBalance(currentAmount, sendPolicy) {
     return null;
   }
 
-  const randomAmount = isObject(sendPolicy && sendPolicy.randomAmount)
-    ? sendPolicy.randomAmount
-    : null;
-  const decimals = Math.min(
-    8,
-    Math.max(
-      0,
-      clampToNonNegativeInt(
-        randomAmount && Object.prototype.hasOwnProperty.call(randomAmount, "decimals")
-          ? randomAmount.decimals
-          : 3,
-        3
-      )
-    )
+  const tierAmounts = isObject(sendPolicy && sendPolicy.tierAmounts) ? sendPolicy.tierAmounts : {};
+  const randomAmount = isObject(sendPolicy && sendPolicy.randomAmount) ? sendPolicy.randomAmount : null;
+  let maxDecimals = clampToNonNegativeInt(
+    randomAmount && Object.prototype.hasOwnProperty.call(randomAmount, "decimals")
+      ? randomAmount.decimals
+      : 3,
+    3
   );
+  for (const tierRange of Object.values(tierAmounts)) {
+    if (isObject(tierRange) && Object.prototype.hasOwnProperty.call(tierRange, "decimals")) {
+      maxDecimals = Math.max(maxDecimals, clampToNonNegativeInt(tierRange.decimals, 3));
+    }
+  }
+  const decimals = Math.min(8, Math.max(0, maxDecimals));
 
   const emergencyFloor = 0.1;
   const reducedRaw = current * 0.6;
@@ -4519,6 +4658,11 @@ function normalizeConfig(rawConfig) {
     INTERNAL_API_DEFAULTS.send.randomAmount,
     "config.send.randomAmount"
   );
+  const tierAmounts = normalizeTierAmountsConfig(
+    sendInput.tierAmounts,
+    INTERNAL_API_DEFAULTS.send.tierAmounts,
+    "config.send.tierAmounts"
+  );
 
   const sequentialAllRounds =
     typeof sendInput.sequentialAllRounds === "boolean"
@@ -4537,6 +4681,7 @@ function normalizeConfig(rawConfig) {
     parallelJitterMaxSeconds,
     delayCycleSeconds,
     sequentialAllRounds,
+    tierAmounts,
     randomAmount
   };
 
@@ -6550,6 +6695,10 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
     qualityScore = parseQualityScoreNumber(qualityLabel);
   }
 
+  if (accountName && tierLabel !== "-") {
+    tierDisplayNameByAccount.set(String(accountName).trim(), tierLabel);
+  }
+
   if (accountName && qualityScore !== null) {
     updateAccountQualityState(accountName, qualityScore, minScoreThreshold, accountLogTag);
   }
@@ -8079,6 +8228,9 @@ async function processAccount(context) {
     );
 
     const sendPolicy = accountConfig.send;
+    const senderTierKey = getAccountTierKey(account.name);
+    const senderTierRange = resolveAmountRangeForTier(sendPolicy, senderTierKey);
+    const senderTierAmountLabel = `${senderTierRange.min}-${senderTierRange.max}`;
 
     // Build send requests based on mode
     let sendRequests = [];
@@ -8092,9 +8244,9 @@ async function processAccount(context) {
       }
 
       // Build requests with random recipient per TX
-      sendRequests = buildSendRequestsWithRandomRecipients(recipientsInfo.recipients, sendPolicy);
+      sendRequests = buildSendRequestsWithRandomRecipients(recipientsInfo.recipients, sendPolicy, account.name);
 
-      const amountLabel = `${sendPolicy.randomAmount.min}-${sendPolicy.randomAmount.max} (random)`;
+      const amountLabel = `${senderTierAmountLabel} [${senderTierKey}]`;
       const recipientsList = sendRequests.map(r => r.label).join(", ");
       dashboard.setState({
         send: `${amountLabel} CC x${sendRequests.length} -> random recipients`,
@@ -8177,7 +8329,7 @@ async function processAccount(context) {
         });
         console.log(
           `[init] Send plan (hybrid/internal): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-            `${fallbackLabel} | preferred-offset=${hybridPlan.primaryOffset}${fallbackSourceLabel}`
+            `${fallbackLabel} | preferred-offset=${hybridPlan.primaryOffset} | tier=${senderTierKey} (${senderTierAmountLabel})${fallbackSourceLabel}`
         );
       } else {
         const primaryRequest = sendRequests[0];
@@ -8188,7 +8340,7 @@ async function processAccount(context) {
         });
         console.log(
           `[init] Send plan (hybrid/external): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-            `${fallbackSourceLabel} | refund=post-send-lowest-balance-priority`
+            `${fallbackSourceLabel} | tier=${senderTierKey} (${senderTierAmountLabel}) | refund=post-send-lowest-balance-priority`
         );
       }
     } else if (sendMode === "internal") {
@@ -8259,7 +8411,7 @@ async function processAccount(context) {
       });
       console.log(
         `[init] Send plan (internal-coverage): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-          `${fallbackLabel} | preferred-offset=${internalPlan.primaryOffset}`
+          `${fallbackLabel} | preferred-offset=${internalPlan.primaryOffset} | tier=${senderTierKey} (${senderTierAmountLabel})`
       );
     } else {
       dashboard.setState({ mode: "balance-only" });
