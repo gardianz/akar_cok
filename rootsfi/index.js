@@ -4210,6 +4210,7 @@ function computeRoundSendPlan(sortedAccounts, accountSnapshots = {}, sendPolicy 
 
   const unsentNames = new Set(allNames);
   let currentSender = sortedByBalanceDesc[0] || "";
+  let expectedInboundFrom = "";
   const planParts = [];
 
   while (unsentNames.size > 0) {
@@ -4252,7 +4253,8 @@ function computeRoundSendPlan(sortedAccounts, accountSnapshots = {}, sendPolicy 
     plan.set(currentSender, {
       preferredRecipients,
       plannedAmount,
-      projectedBalance: senderProjectedBalance
+      projectedBalance: senderProjectedBalance,
+      expectedInboundFrom
     });
 
     if (primaryRecipient) {
@@ -4270,11 +4272,13 @@ function computeRoundSendPlan(sortedAccounts, accountSnapshots = {}, sendPolicy 
       planParts.push(
         `${currentSender}->${primaryRecipient}${plannedAmount ? `(${plannedAmount} CC)` : ""}`
       );
+      expectedInboundFrom = currentSender;
       currentSender = primaryRecipient;
       continue;
     }
 
     planParts.push(`${currentSender}->(none)`);
+    expectedInboundFrom = "";
     currentSender = "";
   }
 
@@ -10457,10 +10461,17 @@ async function runDailyCycle(context) {
   if (forceSequentialAllRounds) {
     console.log("[cycle] Execution mode: sequential all rounds (worker mode disabled)");
   } else {
-    console.log(
-      `[cycle] Worker mode: workers=${workerCount} ` +
-      `(delay between batches ${accountDelayMinSec}-${accountDelayMaxSec}s)`
-    );
+    if (sendMode === "internal") {
+      console.log(
+        `[cycle] Worker mode: internal-chain runs dependency-safe sequential ` +
+        `(configured workers=${workerCount}; delay between accounts ${accountDelayMinSec}-${accountDelayMaxSec}s)`
+      );
+    } else {
+      console.log(
+        `[cycle] Worker mode: workers=${workerCount} ` +
+        `(delay between batches ${accountDelayMinSec}-${accountDelayMaxSec}s)`
+      );
+    }
   }
   console.log(
     `[cycle] Round delay: ${delayRoundSec}s between rounds | max deferred wait: ${maxDeferredWaitSeconds}s | soft restart retry: ${softRestartRetryAfterSeconds}s\n`
@@ -10471,9 +10482,15 @@ async function runDailyCycle(context) {
     
     const maxDeferPassesPerRound = Math.max(3, sortedAccounts.length * 4);
     
-    const effectiveWorkerCount = forceSequentialAllRounds ? 1 : workerCount;
+    const configuredWorkerCount = forceSequentialAllRounds ? 1 : workerCount;
+    const chainDependencyMode = sendMode === "internal";
+    const effectiveWorkerCount = chainDependencyMode
+      ? 1
+      : configuredWorkerCount;
     const executionMode =
-      effectiveWorkerCount > 1 ? `WORKERS x${effectiveWorkerCount}` : "SEQUENTIAL";
+      effectiveWorkerCount > 1
+        ? `WORKERS x${effectiveWorkerCount}`
+        : (chainDependencyMode ? "SEQUENTIAL (chain dependency)" : "SEQUENTIAL");
     
     console.log(`\n[cycle] Round ${loopRound}/${totalLoopRounds} started (${executionMode})`);
 
@@ -10633,6 +10650,20 @@ async function runDailyCycle(context) {
         tokens.accounts[account.name] = accountToken;
         console.log(`[${flowLabel}] [${indexInRound + 1}/${executionEntries.length}] Processing ${account.name}...`);
 
+        const expectedInboundFrom = String(senderPlan.expectedInboundFrom || "").trim();
+        if (
+          chainDependencyMode &&
+          expectedInboundFrom &&
+          !args.dryRun &&
+          !String(entry.deferReason || "").trim()
+        ) {
+          const settleDelaySec = Math.max(1, humanLikeDelay(accountDelayMinSec, accountDelayMaxSec));
+          console.log(
+            `[internal-chain] Waiting ${settleDelaySec}s for inbound settle ${expectedInboundFrom} -> ${account.name} before send...`
+          );
+          await sleep(settleDelaySec * 1000);
+        }
+
         try {
           const result = await processAccount({
             account,
@@ -10715,7 +10746,7 @@ async function runDailyCycle(context) {
         roundResults.push(...batchResults);
         processedCount += batch.length;
 
-        if (batchIndex < batches.length - 1 && !args.dryRun && accountDelayMaxSec > 0) {
+        if (batchIndex < batches.length - 1 && !args.dryRun && accountDelayMaxSec > 0 && !chainDependencyMode) {
           const batchDelaySec = humanLikeDelay(accountDelayMinSec, accountDelayMaxSec);
           console.log(`[${flowLabel}] Waiting ${batchDelaySec}s before next batch...`);
           await sleep(batchDelaySec * 1000);
