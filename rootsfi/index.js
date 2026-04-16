@@ -1337,6 +1337,24 @@ const INTERNAL_API_DEFAULTS = {
     minDelayMs: 450,
     jitterMs: 250
   },
+  session: {
+    preflightOnboard: false,
+    autoRefreshCheckpoint: true,
+    proactiveVercelRefreshMinutes: 45,
+    maxSessionReuseRefreshAttempts: 3,
+    maxSessionReuseTransientAttempts: 6,
+    maxSessionReuseLightResets: 1,
+    maxSessionReuseTransientBrowserRefreshes: 1,
+    transientBrowserRefreshTriggerFailures: 2,
+    sessionReuseTransientRetryAfterSeconds: 45,
+    browserChallengeRetryAfterSeconds: 120,
+    softRestartRetryAfterSeconds: 45,
+    sessionReuseRetryJitterSeconds: 12,
+    maxConcurrentSessionReuse: 1,
+    checkpointSettleDelayMs: 3500,
+    maxOtpRefreshAttempts: 3,
+    fallbackToOtpOnPersistentCheckpoint: true
+  },
   send: {
     maxTransfersPerHour: 1,
     minDelayTxSeconds: 120,
@@ -3393,6 +3411,10 @@ async function saveTokensSerial(tokensPath, tokensState) {
 }
 
 function cloneRuntimeConfig(config) {
+  const sessionConfig = {
+    ...INTERNAL_API_DEFAULTS.session,
+    ...(isObject(config && config.session) ? config.session : {})
+  };
   return {
     ...config,
     paths: { ...config.paths },
@@ -3404,7 +3426,7 @@ function cloneRuntimeConfig(config) {
     },
     http: { ...config.http },
     requestPacing: { ...config.requestPacing },
-    session: { ...config.session },
+    session: sessionConfig,
     send: {
       ...config.send,
       tierAmounts: {
@@ -9844,6 +9866,9 @@ async function runDailyCycle(context) {
   } = context;
 
   const cycleStartTime = new Date();
+  const sessionConfig = isObject(config && config.session)
+    ? config.session
+    : INTERNAL_API_DEFAULTS.session;
   if (telegramReporter) {
     telegramReporter.scheduleText(
       [
@@ -9943,8 +9968,8 @@ async function runDailyCycle(context) {
   const softRestartRetryAfterSeconds = Math.max(
     15,
     clampToNonNegativeInt(
-      config.session && Object.prototype.hasOwnProperty.call(config.session, "softRestartRetryAfterSeconds")
-        ? config.session.softRestartRetryAfterSeconds
+      Object.prototype.hasOwnProperty.call(sessionConfig, "softRestartRetryAfterSeconds")
+        ? sessionConfig.softRestartRetryAfterSeconds
         : INTERNAL_API_DEFAULTS.session.softRestartRetryAfterSeconds,
       INTERNAL_API_DEFAULTS.session.softRestartRetryAfterSeconds
     )
@@ -10545,7 +10570,14 @@ async function run() {
   ]);
 
   const syncedRawConfig = await syncWalleyRefundSenderMap(configPath, rawConfig);
-  const config = normalizeConfig(syncedRawConfig);
+  const normalizedConfig = normalizeConfig(syncedRawConfig);
+  const config = {
+    ...normalizedConfig,
+    session: {
+      ...INTERNAL_API_DEFAULTS.session,
+      ...(isObject(normalizedConfig.session) ? normalizedConfig.session : {})
+    }
+  };
   const accounts = normalizeAccounts(rawAccounts);
   const legacyCookies = extractLegacyAccountCookies(rawAccounts);
   const tokens = normalizeTokens(rawTokens, accounts);
