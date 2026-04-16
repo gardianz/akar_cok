@@ -756,9 +756,11 @@ function buildInternalSendRequests(
   }
 
   cleanupExpiredSendPairs();
+  const senderTierKey = getAccountTierKey(senderName);
+  const senderRange = getEffectiveAmountRangeForSender(sendPolicy, senderName, senderTierKey);
   const amount = fixedAmountInput
     ? normalizeCcAmount(fixedAmountInput)
-    : generateRandomCcAmount(sendPolicy, getAccountTierKey(senderName));
+    : generateRandomCcAmount(senderRange, senderTierKey);
   let requests = [];
   let shortestBlockedCooldownSeconds = 0;
   let skippedByAvoidCount = 0;
@@ -919,12 +921,18 @@ let globalSwapsTotal = 0;
 let globalSwapsOk = 0;
 let globalSwapsFail = 0;
 let txStatsUtcDayKey = "";
+let txStatsUtcHourKey = "";
 
 // Per-account TX tracking - accumulates totals per account for TX Progress column
 const perAccountTxStats = {};
+const perAccountHourlyTxStats = {};
 
 function getCurrentUTCDayKey() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function getCurrentUTCHourKey() {
+  return new Date().toISOString().slice(0, 13);
 }
 
 function ensureTxStatsCurrentUtcDay() {
@@ -949,6 +957,25 @@ function ensureTxStatsCurrentUtcDay() {
   return true;
 }
 
+function ensureTxStatsCurrentUtcHour() {
+  const currentHourKey = getCurrentUTCHourKey();
+  if (!txStatsUtcHourKey) {
+    txStatsUtcHourKey = currentHourKey;
+    return false;
+  }
+
+  if (txStatsUtcHourKey === currentHourKey) {
+    return false;
+  }
+
+  txStatsUtcHourKey = currentHourKey;
+  for (const key of Object.keys(perAccountHourlyTxStats)) {
+    delete perAccountHourlyTxStats[key];
+  }
+  console.log(`[tx-progress] Reset hourly TX counters for new UTC hour: ${currentHourKey}:00Z`);
+  return true;
+}
+
 function getGlobalTxStatsSnapshot() {
   ensureTxStatsCurrentUtcDay();
   return {
@@ -960,12 +987,16 @@ function getGlobalTxStatsSnapshot() {
 
 function resetGlobalTxStats() {
   txStatsUtcDayKey = getCurrentUTCDayKey();
+  txStatsUtcHourKey = getCurrentUTCHourKey();
   globalSwapsTotal = 0;
   globalSwapsOk = 0;
   globalSwapsFail = 0;
   // Clear per-account stats
   for (const key of Object.keys(perAccountTxStats)) {
     delete perAccountTxStats[key];
+  }
+  for (const key of Object.keys(perAccountHourlyTxStats)) {
+    delete perAccountHourlyTxStats[key];
   }
 }
 
@@ -978,17 +1009,30 @@ function addGlobalTxStats(completed, failed) {
 
 function addPerAccountTxStats(accountName, completed, failed) {
   ensureTxStatsCurrentUtcDay();
+  ensureTxStatsCurrentUtcHour();
   if (!perAccountTxStats[accountName]) {
     perAccountTxStats[accountName] = { total: 0, ok: 0, fail: 0 };
   }
   perAccountTxStats[accountName].total += completed + failed;
   perAccountTxStats[accountName].ok += completed;
   perAccountTxStats[accountName].fail += failed;
+
+  if (!perAccountHourlyTxStats[accountName]) {
+    perAccountHourlyTxStats[accountName] = { total: 0, ok: 0, fail: 0 };
+  }
+  perAccountHourlyTxStats[accountName].total += completed + failed;
+  perAccountHourlyTxStats[accountName].ok += completed;
+  perAccountHourlyTxStats[accountName].fail += failed;
 }
 
 function getPerAccountTxStats(accountName) {
   ensureTxStatsCurrentUtcDay();
   return perAccountTxStats[accountName] || { total: 0, ok: 0, fail: 0 };
+}
+
+function getPerAccountHourlyTxStats(accountName) {
+  ensureTxStatsCurrentUtcHour();
+  return perAccountHourlyTxStats[accountName] || { total: 0, ok: 0, fail: 0 };
 }
 
 const qualityScoreByAccount = new Map();
@@ -1294,19 +1338,28 @@ const INTERNAL_API_DEFAULTS = {
     jitterMs: 250
   },
   send: {
-    maxLoopTx: 1,
+    maxTransfersPerHour: 1,
     minDelayTxSeconds: 120,
     maxDelayTxSeconds: 120,
     parallelJitterMinSeconds: 5,
     parallelJitterMaxSeconds: 15,
     delayCycleSeconds: 300,
     sequentialAllRounds: true,
+    workers: 1,
+    maxDeferredWaitSeconds: 45,
     tierAmounts: {
       unranked: { min: "25", max: "50", decimals: 3 },
       newbie: { min: "25", max: "50", decimals: 3 },
       advanced: { min: "50", max: "100", decimals: 3 },
       pro: { min: "75", max: "150", decimals: 3 },
       elite: { min: "150", max: "300", decimals: 3 }
+    },
+    tierDailyTxCap: {
+      unranked: 96,
+      newbie: 120,
+      advanced: 180,
+      pro: 240,
+      elite: 360
     },
     randomAmount: {
       enabled: false,
@@ -2434,7 +2487,7 @@ class PinnedDashboard {
       `🕒 Time  <code>${this.escapeTelegramCode(`${getJakartaTimeStamp()} WIB`)}</code>`,
       `🚦 Run   <b>${escapeHtml(modeLabel)}</b> | ${escapeHtml(String(this.state.phase || "-"))}`,
       `👤 Acct  <b>${escapeHtml(selectedAccount)}</b> | <code>${this.escapeTelegramCode(`${shownAccountCount}/${rows.length || 0}`)}</code> shown`,
-      `📊 TX    <code>${this.escapeTelegramCode(txProgressLabel)}</code> | ok <code>${this.escapeTelegramCode(String(txStats.ok))}</code> | fail <code>${this.escapeTelegramCode(String(txStats.fail))}</code> | target <code>${this.escapeTelegramCode(`${this.state.targetPerDay}/day`)}</code>`
+      `📊 TX    <code>${this.escapeTelegramCode(txProgressLabel)}</code> | ok <code>${this.escapeTelegramCode(String(txStats.ok))}</code> | fail <code>${this.escapeTelegramCode(String(txStats.fail))}</code> | target <code>${this.escapeTelegramCode(`${this.state.targetPerDay}/hour`)}</code>`
     ];
 
     if (Number.isFinite(aggregateBalance.total)) {
@@ -2628,7 +2681,7 @@ class PinnedDashboard {
       `Time  ${now} WIB`,
       `Run   ${modeLabel} | ${this.state.phase}`,
       `Acct  ${selectedAccount} | ${shownAccountCount}/${rows.length || 0} shown`,
-      `TX    ${txProgressLabel} | ok ${txStats.ok} | fail ${txStats.fail} | target ${this.state.targetPerDay}/day`
+      `TX    ${txProgressLabel} | ok ${txStats.ok} | fail ${txStats.fail} | target ${this.state.targetPerDay}/hour`
     ];
 
     if (Number.isFinite(aggregateBalance.total)) {
@@ -2729,7 +2782,7 @@ class PinnedDashboard {
       );
       lines.push(
         bannerLine(
-          `Sends: ${txStats.total}/${txStats.total} total  ${txStats.ok} ok  ${txStats.fail} fail  |  Target: ${this.state.targetPerDay}/day`
+          `Sends: ${txStats.total}/${txStats.total} total  ${txStats.ok} ok  ${txStats.fail} fail  |  Target: ${this.state.targetPerDay}/hour`
         )
       );
       if (Number.isFinite(aggregateBalance.total)) {
@@ -3357,6 +3410,9 @@ function cloneRuntimeConfig(config) {
       tierAmounts: {
         ...(isObject(config.send && config.send.tierAmounts) ? config.send.tierAmounts : {})
       },
+      tierDailyTxCap: {
+        ...(isObject(config.send && config.send.tierDailyTxCap) ? config.send.tierDailyTxCap : {})
+      },
       randomAmount: {
         ...(isObject(config.send && config.send.randomAmount) ? config.send.randomAmount : {})
       }
@@ -3535,6 +3591,7 @@ function normalizeCcAmount(rawAmount) {
 
 const TIER_KEYS = ["unranked", "newbie", "advanced", "pro", "elite"];
 const tierDisplayNameByAccount = new Map();
+const tierMinSendByAccount = new Map();
 
 function resolveTierKey(tierDisplayName) {
   const key = String(tierDisplayName || "").trim().toLowerCase();
@@ -3547,6 +3604,15 @@ function getAccountTierKey(accountName) {
     return "unranked";
   }
   return resolveTierKey(tierDisplayNameByAccount.get(normalizedName));
+}
+
+function getAccountTierMinSend(accountName) {
+  const normalizedName = String(accountName || "").trim();
+  if (!normalizedName) {
+    return 0;
+  }
+  const numeric = Number(tierMinSendByAccount.get(normalizedName));
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
 }
 
 function normalizeRandomAmountConfig(rawRandomAmount, fallback, pathLabel) {
@@ -3617,6 +3683,25 @@ function normalizeTierAmountsConfig(rawTierAmounts, fallback, pathLabel) {
   return result;
 }
 
+function normalizeTierDailyTxCapConfig(rawTierCaps, fallback, pathLabel) {
+  const defaults = isObject(fallback) ? fallback : INTERNAL_API_DEFAULTS.send.tierDailyTxCap;
+  const input = isObject(rawTierCaps) ? rawTierCaps : {};
+  const result = {};
+
+  for (const key of TIER_KEYS) {
+    const tierDefault = clampToNonNegativeInt(defaults[key], 0);
+    result[key] = Math.max(
+      0,
+      clampToNonNegativeInt(
+        Object.prototype.hasOwnProperty.call(input, key) ? input[key] : tierDefault,
+        tierDefault
+      )
+    );
+  }
+
+  return result;
+}
+
 function resolveAmountRangeForTier(sendPolicyOrRange, tierKey) {
   if (!isObject(sendPolicyOrRange)) {
     return INTERNAL_API_DEFAULTS.send.randomAmount;
@@ -3642,6 +3727,74 @@ function resolveAmountRangeForTier(sendPolicyOrRange, tierKey) {
   return INTERNAL_API_DEFAULTS.send.randomAmount;
 }
 
+function getEffectiveAmountRangeForSender(sendPolicyOrRange, senderName, fallbackTierKey = null) {
+  const normalizedSender = String(senderName || "").trim();
+  const tierKey = fallbackTierKey || getAccountTierKey(normalizedSender);
+  const baseRange = resolveAmountRangeForTier(sendPolicyOrRange, tierKey);
+  const decimals = clampToNonNegativeInt(baseRange && baseRange.decimals, 3);
+  const baseMin = Number(baseRange && baseRange.min);
+  const baseMax = Number(baseRange && baseRange.max);
+  const tierMinSend = getAccountTierMinSend(normalizedSender);
+  const effectiveMinNumeric = Math.max(
+    Number.isFinite(baseMin) ? baseMin : 0,
+    Number.isFinite(tierMinSend) ? tierMinSend : 0
+  );
+  const effectiveMaxNumeric = Math.max(
+    effectiveMinNumeric,
+    Number.isFinite(baseMax) ? baseMax : effectiveMinNumeric
+  );
+
+  return {
+    min: normalizeCcAmount(effectiveMinNumeric.toFixed(decimals)),
+    max: normalizeCcAmount(effectiveMaxNumeric.toFixed(decimals)),
+    decimals
+  };
+}
+
+function getAccountTierDailyTxCap(config, accountName) {
+  const tierKey = getAccountTierKey(accountName);
+  const caps = isObject(config && config.send && config.send.tierDailyTxCap)
+    ? config.send.tierDailyTxCap
+    : INTERNAL_API_DEFAULTS.send.tierDailyTxCap;
+  const cap = Number(caps[tierKey]);
+  if (!Number.isFinite(cap) || cap <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(cap));
+}
+
+function hasReachedAccountTierDailyTxCap(config, accountName) {
+  const cap = getAccountTierDailyTxCap(config, accountName);
+  if (cap <= 0) {
+    return false;
+  }
+  const stats = getPerAccountTxStats(accountName);
+  return stats.total >= cap;
+}
+
+function getAccountHourlyTxCap(config) {
+  const cap = Number(
+    config &&
+    config.send &&
+    Object.prototype.hasOwnProperty.call(config.send, "maxTransfersPerHour")
+      ? config.send.maxTransfersPerHour
+      : INTERNAL_API_DEFAULTS.send.maxTransfersPerHour
+  );
+  if (!Number.isFinite(cap) || cap <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.floor(cap));
+}
+
+function hasReachedAccountHourlyTxCap(config, accountName) {
+  const cap = getAccountHourlyTxCap(config);
+  if (cap <= 0) {
+    return false;
+  }
+  const stats = getPerAccountHourlyTxStats(accountName);
+  return stats.total >= cap;
+}
+
 function generateRandomCcAmount(sendPolicyOrRange, tierKey = null) {
   const amountRange = resolveAmountRangeForTier(sendPolicyOrRange, tierKey);
   const decimals = clampToNonNegativeInt(amountRange.decimals, 2);
@@ -3661,10 +3814,10 @@ function generateRandomCcAmount(sendPolicyOrRange, tierKey = null) {
 function buildSendRequestsWithRandomRecipients(recipients, sendPolicy, senderName = null) {
   const requests = [];
   const txCount = clampToNonNegativeInt(sendPolicy.maxLoopTx || sendPolicy.maxTx, 1);
-  const senderTierKey = getAccountTierKey(senderName);
+  const senderRange = getEffectiveAmountRangeForSender(sendPolicy, senderName);
 
   for (let index = 0; index < txCount; index += 1) {
-    const amount = generateRandomCcAmount(sendPolicy, senderTierKey);
+    const amount = generateRandomCcAmount(senderRange, getAccountTierKey(senderName));
     const target = getRandomRecipient(recipients);
 
     requests.push({
@@ -3679,7 +3832,10 @@ function buildSendRequestsWithRandomRecipients(recipients, sendPolicy, senderNam
 }
 
 function buildSingleExternalRandomRequest(recipients, sendPolicy, source = "external-random", senderName = null) {
-  const amount = generateRandomCcAmount(sendPolicy, getAccountTierKey(senderName));
+  const amount = generateRandomCcAmount(
+    getEffectiveAmountRangeForSender(sendPolicy, senderName),
+    getAccountTierKey(senderName)
+  );
   const target = getRandomRecipient(recipients);
 
   return {
@@ -3729,11 +3885,12 @@ function buildSendRequests(target, sendPolicy, fixedAmountInput, idempotencySeed
   const requests = [];
   const txCount = clampToNonNegativeInt(sendPolicy.maxLoopTx || sendPolicy.maxTx, 1);
   const senderTierKey = getAccountTierKey(senderName);
+  const senderRange = getEffectiveAmountRangeForSender(sendPolicy, senderName, senderTierKey);
 
   for (let index = 0; index < txCount; index += 1) {
     const amount = fixedAmountInput
       ? normalizeCcAmount(fixedAmountInput)
-      : generateRandomCcAmount(sendPolicy, senderTierKey);
+      : generateRandomCcAmount(senderRange, senderTierKey);
 
     let idempotencyKey = null;
     if (idempotencySeed) {
@@ -3872,15 +4029,14 @@ function buildBalanceAwareRecipientPriority(
 }
 
 function getTierMinimumAmountForSender(sendPolicy, senderName) {
-  const tierKey = getAccountTierKey(senderName);
-  const tierRange = resolveAmountRangeForTier(sendPolicy, tierKey);
+  const tierRange = getEffectiveAmountRangeForSender(sendPolicy, senderName);
   const tierMin = Number(tierRange && tierRange.min);
   return Number.isFinite(tierMin) ? tierMin : 0;
 }
 
 function generateTierBalancedAmount(sendPolicy, senderName, spendableAmount) {
   const tierKey = getAccountTierKey(senderName);
-  const tierRange = resolveAmountRangeForTier(sendPolicy, tierKey);
+  const tierRange = getEffectiveAmountRangeForSender(sendPolicy, senderName, tierKey);
   const minAmount = Number(tierRange && tierRange.min);
   const maxAmount = Number(tierRange && tierRange.max);
   const decimals = clampToNonNegativeInt(tierRange && tierRange.decimals, 3);
@@ -4731,6 +4887,10 @@ function normalizeConfig(rawConfig) {
       60,
       clampToNonNegativeInt(sessionInput.browserChallengeRetryAfterSeconds, 120)
     ),
+    softRestartRetryAfterSeconds: Math.max(
+      15,
+      clampToNonNegativeInt(sessionInput.softRestartRetryAfterSeconds, 45)
+    ),
     sessionReuseRetryJitterSeconds: Math.max(
       0,
       clampToNonNegativeInt(sessionInput.sessionReuseRetryJitterSeconds, 12)
@@ -4902,18 +5062,17 @@ function normalizeConfig(rawConfig) {
   }
 
   const sendInput = isObject(rawConfig.send) ? rawConfig.send : {};
-  const maxLoopTx = clampToNonNegativeInt(
-    Object.prototype.hasOwnProperty.call(sendInput, "maxLoopTx")
-      ? sendInput.maxLoopTx
-      : (
-          Object.prototype.hasOwnProperty.call(sendInput, "maxTx")
-            ? sendInput.maxTx
-            : sendInput.maxTxPerAccount
-        ),
-    INTERNAL_API_DEFAULTS.send.maxLoopTx
+  const maxTransfersPerHour = Math.max(
+    1,
+    clampToNonNegativeInt(
+      Object.prototype.hasOwnProperty.call(sendInput, "maxTransfersPerHour")
+        ? sendInput.maxTransfersPerHour
+        : INTERNAL_API_DEFAULTS.send.maxTransfersPerHour,
+      INTERNAL_API_DEFAULTS.send.maxTransfersPerHour
+    )
   );
-  if (maxLoopTx < 1) {
-    throw new Error("config.send.maxLoopTx must be >= 1");
+  if (maxTransfersPerHour < 1) {
+    throw new Error("config.send.maxTransfersPerHour must be >= 1");
   }
 
   const legacyDelayBetweenTx = isObject(sendInput.delayBetweenTx)
@@ -5019,15 +5178,39 @@ function normalizeConfig(rawConfig) {
             : INTERNAL_API_DEFAULTS.send.sequentialAllRounds
         );
 
+  const workers = Math.max(
+    1,
+    clampToNonNegativeInt(
+      sendInput.workers,
+      INTERNAL_API_DEFAULTS.send.workers
+    )
+  );
+  const maxDeferredWaitSeconds = Math.max(
+    1,
+    clampToNonNegativeInt(
+      sendInput.maxDeferredWaitSeconds,
+      INTERNAL_API_DEFAULTS.send.maxDeferredWaitSeconds
+    )
+  );
+  const tierDailyTxCap = normalizeTierDailyTxCapConfig(
+    sendInput.tierDailyTxCap,
+    INTERNAL_API_DEFAULTS.send.tierDailyTxCap,
+    "config.send.tierDailyTxCap"
+  );
+
   const send = {
-    maxLoopTx,
+    maxLoopTx: maxTransfersPerHour,
+    maxTransfersPerHour,
     minDelayTxSeconds,
     maxDelayTxSeconds,
     parallelJitterMinSeconds,
     parallelJitterMaxSeconds,
     delayCycleSeconds,
     sequentialAllRounds,
+    workers,
+    maxDeferredWaitSeconds,
     tierAmounts,
+    tierDailyTxCap,
     randomAmount
   };
 
@@ -6977,6 +7160,7 @@ function extractRewardsInsightsFromResponse(payload) {
 }
 
 async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag = null, accountName = null, minScoreThreshold = null) {
+  let overviewResponse = null;
   let rewardLabel = "-";
   let rewardsThisWeekLabel = "-";
   let rewardsDiffLabel = "-";
@@ -6988,7 +7172,7 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
   let qualityScore = null;
 
   try {
-    const overviewResponse = await client.getRewardsOverview();
+    overviewResponse = await client.getRewardsOverview();
     rewardLabel = extractThisWeekRewardLabelFromResponse(overviewResponse);
     const rewardMetrics = extractThisWeekRewardMetricsFromResponse(overviewResponse);
     if (accountName && (Number.isFinite(rewardMetrics.cc) || Number.isFinite(rewardMetrics.usd))) {
@@ -7043,6 +7227,24 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
 
   if (accountName && tierLabel !== "-") {
     tierDisplayNameByAccount.set(String(accountName).trim(), tierLabel);
+  }
+
+  if (accountName) {
+    const data = isObject(overviewResponse && overviewResponse.data) ? overviewResponse.data : {};
+    const tierProgress = isObject(data.tierProgress) ? data.tierProgress : {};
+    const currentTier = isObject(tierProgress.currentTier) ? tierProgress.currentTier : {};
+    const tierMinCandidates = [
+      currentTier.minCcWholeTokensPerQualifyingSend,
+      tierProgress.minCcWholeTokensPerQualifyingSend,
+      data.minCcWholeTokensPerQualifyingSend
+    ];
+    for (const candidate of tierMinCandidates) {
+      const numeric = Number(candidate);
+      if (Number.isFinite(numeric) && numeric > 0) {
+        tierMinSendByAccount.set(String(accountName).trim(), numeric);
+        break;
+      }
+    }
   }
 
   if (accountName && qualityScore !== null) {
@@ -8516,20 +8718,21 @@ async function processAccount(context) {
       `browserRefresh=${accountConfig.session.maxSessionReuseTransientBrowserRefreshes}`
     );
   }
-  const configuredMaxLoopTx = clampToNonNegativeInt(
-    accountConfig.send.maxLoopTx || accountConfig.send.maxTx,
-    1
+  const configuredMaxTransfersPerHour = clampToNonNegativeInt(
+    accountConfig.send.maxTransfersPerHour,
+    INTERNAL_API_DEFAULTS.send.maxTransfersPerHour
   );
   const effectiveMaxLoopTx = Number.isFinite(Number(maxLoopTxOverride))
     ? Math.max(1, clampToNonNegativeInt(maxLoopTxOverride, 1))
-    : configuredMaxLoopTx;
+    : configuredMaxTransfersPerHour;
   accountConfig.send.maxLoopTx = effectiveMaxLoopTx;
+  accountConfig.send.maxTransfersPerHour = configuredMaxTransfersPerHour;
 
   const cycleLoopRounds = Math.max(
     1,
-    clampToNonNegativeInt(totalLoopRounds, configuredMaxLoopTx)
+    clampToNonNegativeInt(totalLoopRounds, configuredMaxTransfersPerHour)
   );
-  const accountTargetPerDay =
+  const accountTargetPerHour =
     cycleLoopRounds *
     Math.max(1, selectedAccountList.length);
   const defaultMinCooldownSeconds = clampToNonNegativeInt(
@@ -8579,7 +8782,7 @@ async function processAccount(context) {
     phase: "init",
     selectedAccount: `[${accountIndex + 1}/${totalAccounts}] ${account.name} (${maskEmail(selectedEmail)})`,
     accounts: accountRows,
-    targetPerDay: String(accountTargetPerDay),
+    targetPerDay: String(accountTargetPerHour),
     cooldown: cooldownLabel,
     swapsTotal: "0/0",
     swapsOk: "0",
@@ -8613,201 +8816,214 @@ async function processAccount(context) {
     );
 
     const sendPolicy = accountConfig.send;
-    const senderTierKey = getAccountTierKey(account.name);
-    const senderTierRange = resolveAmountRangeForTier(sendPolicy, senderTierKey);
-    const senderTierAmountLabel = `${senderTierRange.min}-${senderTierRange.max}`;
-
-    // Build send requests based on mode
     let sendRequests = [];
-    if (sendMode === "external") {
-      if (recipientsInfo.missing || recipientsInfo.recipients.length === 0) {
-        throw new Error("External mode requires recipient.txt with valid recipients");
-      }
+    let buildDeferResult = null;
+    const buildSendRequestsNow = () => {
+      const senderTierKey = getAccountTierKey(account.name);
+      const senderTierRange = getEffectiveAmountRangeForSender(sendPolicy, account.name, senderTierKey);
+      const senderTierAmountLabel = `${senderTierRange.min}-${senderTierRange.max}`;
+      sendRequests = [];
+      buildDeferResult = null;
 
-      if (!sendPolicy.randomAmount.enabled) {
-        throw new Error("External mode requires config.send.randomAmount.enabled=true");
-      }
+      if (sendMode === "external") {
+        if (recipientsInfo.missing || recipientsInfo.recipients.length === 0) {
+          throw new Error("External mode requires recipient.txt with valid recipients");
+        }
 
-      // Build requests with random recipient per TX
-      sendRequests = buildSendRequestsWithRandomRecipients(recipientsInfo.recipients, sendPolicy, account.name);
+        if (!sendPolicy.randomAmount.enabled) {
+          throw new Error("External mode requires config.send.randomAmount.enabled=true");
+        }
 
-      const amountLabel = `${senderTierAmountLabel} [${senderTierKey}]`;
-      const recipientsList = sendRequests.map(r => r.label).join(", ");
-      dashboard.setState({
-        send: `${amountLabel} CC x${sendRequests.length} -> random recipients`,
-        mode: "external"
-      });
-      console.log(`[init] Send plan: ${amountLabel} CC x${sendRequests.length} -> [${recipientsList}]`);
-    } else if (sendMode === "hybrid") {
-      if (recipientsInfo.missing || recipientsInfo.recipients.length === 0) {
-        throw new Error("Hybrid mode requires recipient.txt with valid recipients");
-      }
-
-      if (!sendPolicy.randomAmount.enabled) {
-        throw new Error("Hybrid mode requires config.send.randomAmount.enabled=true");
-      }
-
-      const hybridPlan = buildHybridSendRequests(
-        selectedAccounts,
-        account.name,
-        recipientsInfo.recipients,
-        sendPolicy,
-        currentRound,
-        safeSmartFillBlockRecipients,
-        hybridAssignedMode,
-        Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
-        plannedInternalAmount || null
-      );
-
-      if (hybridPlan.selectedMode === "internal" && safeSmartFillBlockRecipients.length > 0) {
-        console.log(
-          `[hybrid] Smart-fill guard for ${account.name}: avoid send-back to [${safeSmartFillBlockRecipients.join(", ")}]`
-        );
-      }
-
-      if (!hybridPlan || hybridPlan.requests.length === 0) {
-        const retryAfterSeconds = Math.max(
-          TX_RETRY_INITIAL_DELAY_SECONDS,
-          clampToNonNegativeInt(
-            hybridPlan && hybridPlan.retryAfterSeconds,
-            TX_RETRY_INITIAL_DELAY_SECONDS
-          )
-        );
-        const deferReason =
-          hybridPlan && hybridPlan.reason
-            ? hybridPlan.reason
-            : "hybrid-recipient-unavailable";
-
-        console.log(
-          `[hybrid] ${account.name}: defer send (${deferReason}) for ${retryAfterSeconds}s`
-        );
+        sendRequests = buildSendRequestsWithRandomRecipients(recipientsInfo.recipients, sendPolicy, account.name);
+        const amountLabel = `${senderTierAmountLabel} [${senderTierKey}]`;
+        const recipientsList = sendRequests.map((r) => r.label).join(", ");
         dashboard.setState({
-          phase: "cooldown",
-          send: `Deferred hybrid send for ${retryAfterSeconds}s`,
-          transfer: "deferred (hybrid-recipient)",
-          cooldown: `${retryAfterSeconds}s`,
-          mode: "hybrid"
+          send: `${amountLabel} CC x${sendRequests.length} -> random recipients`,
+          mode: "external"
         });
-
-        return {
-          success: true,
-          account: account.name,
-          mode: "hybrid-deferred",
-          deferred: true,
-          deferReason,
-          deferRetryAfterSeconds: retryAfterSeconds,
-          deferRequiredAmount: null,
-          deferAvailableAmount: null,
-          txCompleted: 0,
-          txSkipped: 0
-        };
+        console.log(`[init] Send plan: ${amountLabel} CC x${sendRequests.length} -> [${recipientsList}]`);
+        return;
       }
 
-      sendRequests = hybridPlan.requests;
-      if (hybridPlan.selectedMode === "internal") {
+      if (sendMode === "hybrid") {
+        if (recipientsInfo.missing || recipientsInfo.recipients.length === 0) {
+          throw new Error("Hybrid mode requires recipient.txt with valid recipients");
+        }
+
+        if (!sendPolicy.randomAmount.enabled) {
+          throw new Error("Hybrid mode requires config.send.randomAmount.enabled=true");
+        }
+
+        const hybridPlan = buildHybridSendRequests(
+          selectedAccounts,
+          account.name,
+          recipientsInfo.recipients,
+          sendPolicy,
+          currentRound,
+          safeSmartFillBlockRecipients,
+          hybridAssignedMode,
+          Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
+          plannedInternalAmount || null
+        );
+
+        if (hybridPlan.selectedMode === "internal" && safeSmartFillBlockRecipients.length > 0) {
+          console.log(
+            `[hybrid] Smart-fill guard for ${account.name}: avoid send-back to [${safeSmartFillBlockRecipients.join(", ")}]`
+          );
+        }
+
+        if (!hybridPlan || hybridPlan.requests.length === 0) {
+          const retryAfterSeconds = Math.max(
+            TX_RETRY_INITIAL_DELAY_SECONDS,
+            clampToNonNegativeInt(
+              hybridPlan && hybridPlan.retryAfterSeconds,
+              TX_RETRY_INITIAL_DELAY_SECONDS
+            )
+          );
+          const deferReason =
+            hybridPlan && hybridPlan.reason
+              ? hybridPlan.reason
+              : "hybrid-recipient-unavailable";
+
+          console.log(
+            `[hybrid] ${account.name}: defer send (${deferReason}) for ${retryAfterSeconds}s`
+          );
+          dashboard.setState({
+            phase: "cooldown",
+            send: `Deferred hybrid send for ${retryAfterSeconds}s`,
+            transfer: "deferred (hybrid-recipient)",
+            cooldown: `${retryAfterSeconds}s`,
+            mode: "hybrid"
+          });
+
+          buildDeferResult = {
+            success: true,
+            account: account.name,
+            mode: "hybrid-deferred",
+            deferred: true,
+            deferReason,
+            deferRetryAfterSeconds: retryAfterSeconds,
+            deferRequiredAmount: null,
+            deferAvailableAmount: null,
+            txCompleted: 0,
+            txSkipped: 0
+          };
+          return;
+        }
+
+        sendRequests = hybridPlan.requests;
+        if (hybridPlan.selectedMode === "internal") {
+          const primaryRequest = sendRequests[0];
+          const fallbackCount = Math.max(0, sendRequests.length - 1);
+          const fallbackLabel = fallbackCount > 0 ? ` (+${fallbackCount} fallback)` : "";
+          const fallbackSourceLabel = hybridPlan.fallbackUsed ? " [fallback from external]" : "";
+          dashboard.setState({
+            send: `${primaryRequest.amount} CC -> ${primaryRequest.label}${fallbackLabel}`,
+            mode: "hybrid-internal"
+          });
+          console.log(
+            `[init] Send plan (hybrid/internal): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
+              `${fallbackLabel} | preferred-offset=${hybridPlan.primaryOffset} | tier=${senderTierKey} (${senderTierAmountLabel})${fallbackSourceLabel}`
+          );
+        } else {
+          const primaryRequest = sendRequests[0];
+          const fallbackSourceLabel = hybridPlan.fallbackUsed ? " [fallback from internal]" : "";
+          dashboard.setState({
+            send: `${primaryRequest.amount} CC -> ${primaryRequest.label}`,
+            mode: "hybrid-external"
+          });
+          console.log(
+            `[init] Send plan (hybrid/external): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
+              `${fallbackSourceLabel} | tier=${senderTierKey} (${senderTierAmountLabel}) | refund=post-send-lowest-balance-priority`
+          );
+        }
+        return;
+      }
+
+      if (sendMode === "internal") {
+        if (!sendPolicy.randomAmount.enabled) {
+          throw new Error("Internal mode requires config.send.randomAmount.enabled=true");
+        }
+
+        const internalPlan = buildInternalSendRequests(
+          selectedAccounts,
+          account.name,
+          sendPolicy,
+          currentRound,
+          safeSmartFillBlockRecipients,
+          Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
+          plannedInternalAmount || null
+        );
+
+        if (safeSmartFillBlockRecipients.length > 0) {
+          console.log(
+            `[internal] Smart-fill guard for ${account.name}: avoid send-back to [${safeSmartFillBlockRecipients.join(", ")}]`
+          );
+        }
+
+        if (!internalPlan || internalPlan.requests.length === 0) {
+          const retryAfterSeconds = Math.max(
+            TX_RETRY_INITIAL_DELAY_SECONDS,
+            clampToNonNegativeInt(
+              internalPlan && internalPlan.retryAfterSeconds,
+              TX_RETRY_INITIAL_DELAY_SECONDS
+            )
+          );
+          const deferReason =
+            internalPlan && internalPlan.reason
+              ? internalPlan.reason
+              : "internal-recipient-unavailable";
+
+          console.log(
+            `[internal] ${account.name}: defer send (${deferReason}) for ${retryAfterSeconds}s`
+          );
+          dashboard.setState({
+            phase: "cooldown",
+            send: `Deferred internal send for ${retryAfterSeconds}s`,
+            transfer: "deferred (internal-recipient)",
+            cooldown: `${retryAfterSeconds}s`,
+            mode: "internal-coverage"
+          });
+
+          buildDeferResult = {
+            success: true,
+            account: account.name,
+            mode: "internal-coverage-deferred",
+            deferred: true,
+            deferReason,
+            deferRetryAfterSeconds: retryAfterSeconds,
+            deferRequiredAmount: null,
+            deferAvailableAmount: null,
+            txCompleted: 0,
+            txSkipped: 0
+          };
+          return;
+        }
+
+        sendRequests = internalPlan.requests;
         const primaryRequest = sendRequests[0];
         const fallbackCount = Math.max(0, sendRequests.length - 1);
         const fallbackLabel = fallbackCount > 0 ? ` (+${fallbackCount} fallback)` : "";
-        const fallbackSourceLabel = hybridPlan.fallbackUsed ? " [fallback from external]" : "";
-
         dashboard.setState({
           send: `${primaryRequest.amount} CC -> ${primaryRequest.label}${fallbackLabel}`,
-          mode: "hybrid-internal"
-        });
-        console.log(
-          `[init] Send plan (hybrid/internal): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-            `${fallbackLabel} | preferred-offset=${hybridPlan.primaryOffset} | tier=${senderTierKey} (${senderTierAmountLabel})${fallbackSourceLabel}`
-        );
-      } else {
-        const primaryRequest = sendRequests[0];
-        const fallbackSourceLabel = hybridPlan.fallbackUsed ? " [fallback from internal]" : "";
-        dashboard.setState({
-          send: `${primaryRequest.amount} CC -> ${primaryRequest.label}`,
-          mode: "hybrid-external"
-        });
-        console.log(
-          `[init] Send plan (hybrid/external): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-            `${fallbackSourceLabel} | tier=${senderTierKey} (${senderTierAmountLabel}) | refund=post-send-lowest-balance-priority`
-        );
-      }
-    } else if (sendMode === "internal") {
-      if (!sendPolicy.randomAmount.enabled) {
-        throw new Error("Internal mode requires config.send.randomAmount.enabled=true");
-      }
-
-      const internalPlan = buildInternalSendRequests(
-        selectedAccounts,
-        account.name,
-        sendPolicy,
-        currentRound,
-        safeSmartFillBlockRecipients,
-        Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
-        plannedInternalAmount || null
-      );
-
-      if (safeSmartFillBlockRecipients.length > 0) {
-        console.log(
-          `[internal] Smart-fill guard for ${account.name}: avoid send-back to [${safeSmartFillBlockRecipients.join(", ")}]`
-        );
-      }
-
-      if (!internalPlan || internalPlan.requests.length === 0) {
-        const retryAfterSeconds = Math.max(
-          TX_RETRY_INITIAL_DELAY_SECONDS,
-          clampToNonNegativeInt(
-            internalPlan && internalPlan.retryAfterSeconds,
-            TX_RETRY_INITIAL_DELAY_SECONDS
-          )
-        );
-        const deferReason =
-          internalPlan && internalPlan.reason
-            ? internalPlan.reason
-            : "internal-recipient-unavailable";
-
-        console.log(
-          `[internal] ${account.name}: defer send (${deferReason}) for ${retryAfterSeconds}s`
-        );
-        dashboard.setState({
-          phase: "cooldown",
-          send: `Deferred internal send for ${retryAfterSeconds}s`,
-          transfer: "deferred (internal-recipient)",
-          cooldown: `${retryAfterSeconds}s`,
           mode: "internal-coverage"
         });
-
-        return {
-          success: true,
-          account: account.name,
-          mode: "internal-coverage-deferred",
-          deferred: true,
-          deferReason,
-          deferRetryAfterSeconds: retryAfterSeconds,
-          deferRequiredAmount: null,
-          deferAvailableAmount: null,
-          txCompleted: 0,
-          txSkipped: 0
-        };
+        console.log(
+          `[init] Send plan (internal-coverage): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
+            `${fallbackLabel} | preferred-offset=${internalPlan.primaryOffset} | tier=${senderTierKey} (${senderTierAmountLabel})`
+        );
+        return;
       }
 
-      sendRequests = internalPlan.requests;
-      const primaryRequest = sendRequests[0];
-      const fallbackCount = Math.max(0, sendRequests.length - 1);
-      const fallbackLabel = fallbackCount > 0 ? ` (+${fallbackCount} fallback)` : "";
-
-      dashboard.setState({
-        send: `${primaryRequest.amount} CC -> ${primaryRequest.label}${fallbackLabel}`,
-        mode: "internal-coverage"
-      });
-      console.log(
-        `[init] Send plan (internal-coverage): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-          `${fallbackLabel} | preferred-offset=${internalPlan.primaryOffset} | tier=${senderTierKey} (${senderTierAmountLabel})`
-      );
-    } else {
       dashboard.setState({ mode: "balance-only" });
       console.log("[init] Balance check only mode");
-    }
+    };
 
     if (args.dryRun) {
+      buildSendRequestsNow();
+      if (buildDeferResult) {
+        return buildDeferResult;
+      }
       dashboard.setState({ phase: "dry-run" });
       console.log("[dry-run] Configuration parsed successfully. No API requests were sent.");
       return {
@@ -9049,6 +9265,20 @@ async function processAccount(context) {
           account.name,
           minScoreThreshold
         );
+
+        buildSendRequestsNow();
+        if (buildDeferResult) {
+          client.logCookieStatus("after session reuse");
+          updateCookieDashboard(client, "session-reused");
+          tokens.accounts[account.name] = applyClientStateToTokenProfile(
+            accountToken,
+            client,
+            checkpointRefreshCount,
+            lastVercelRefreshAt
+          );
+          await saveTokensSerial(tokensPath, tokens);
+          return buildDeferResult;
+        }
 
         let sendBatchResult = {
           completedTx: 0,
@@ -9385,6 +9615,20 @@ async function processAccount(context) {
       minScoreThreshold
     );
 
+    buildSendRequestsNow();
+    if (buildDeferResult) {
+      client.logCookieStatus("after login flow");
+      updateCookieDashboard(client, "completed");
+      tokens.accounts[account.name] = applyClientStateToTokenProfile(
+        accountToken,
+        client,
+        checkpointRefreshCount,
+        lastVercelRefreshAt
+      );
+      await saveTokensSerial(tokensPath, tokens);
+      return buildDeferResult;
+    }
+
     let sendBatchResult = {
       completedTx: 0,
       skippedTx: 0,
@@ -9499,15 +9743,16 @@ async function processAccount(context) {
   }
 }
 
-function getNextMidnightUTC() {
-  const now = new Date();
-  const tomorrow = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate() + 1,
-    0, 0, 0, 0
+function getNextHourUTC(date = new Date()) {
+  return new Date(Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate(),
+    date.getUTCHours() + 1,
+    0,
+    0,
+    0
   ));
-  return tomorrow;
 }
 
 function formatDuration(ms) {
@@ -9522,6 +9767,69 @@ function formatUTCTime(date) {
   return date.toISOString().replace("T", " ").slice(0, 19) + " UTC";
 }
 
+async function runStartupBalanceWarmup(context) {
+  const selectedAccounts = Array.isArray(context && context.accounts && context.accounts.accounts)
+    ? context.accounts.accounts
+    : [];
+  if (selectedAccounts.length === 0) {
+    return;
+  }
+
+  const accountSnapshots =
+    isObject(context && context.accountSnapshots) ? context.accountSnapshots : {};
+  context.accountSnapshots = accountSnapshots;
+
+  console.log(
+    `[startup] Warmup started: refreshing balance and rewards for ${selectedAccounts.length} account(s) before hourly cycle execution`
+  );
+
+  const warmupArgs = {
+    ...(isObject(context && context.args) ? context.args : {}),
+    noDashboard: true
+  };
+
+  for (let index = 0; index < selectedAccounts.length; index += 1) {
+    const account = selectedAccounts[index];
+    const accountToken = context.tokens.accounts[account.name] || normalizeTokenProfile({});
+    context.tokens.accounts[account.name] = accountToken;
+
+    try {
+      await processAccount({
+        account,
+        accountToken,
+        config: context.config,
+        tokens: context.tokens,
+        tokensPath: context.tokensPath,
+        sendMode: "balance-only",
+        recipientsInfo: context.recipientsInfo,
+        args: warmupArgs,
+        accountIndex: index,
+        totalAccounts: selectedAccounts.length,
+        selectedAccounts,
+        accountSnapshots,
+        telegramReporter: null,
+        walleyRefundBridge: null,
+        loopRound: 1,
+        totalLoopRounds: 1,
+        hybridAssignedMode: null,
+        deferWalleyRefundsToRoundLevel: true,
+        maxLoopTxOverride: null,
+        smartFillBlockRecipients: [],
+        resumeFromDeferReason: "",
+        preferredInternalRecipients: [],
+        plannedInternalAmount: null
+      });
+      console.log(`[startup] Warmup ${index + 1}/${selectedAccounts.length}: ${account.name} ready`);
+    } catch (error) {
+      console.log(
+        `[startup] Warmup ${index + 1}/${selectedAccounts.length}: ${account.name} failed -> ${error.message}`
+      );
+    }
+  }
+
+  console.log("[startup] Warmup completed.\n");
+}
+
 async function runDailyCycle(context) {
   const {
     config,
@@ -9532,7 +9840,8 @@ async function runDailyCycle(context) {
     recipientsInfo,
     args,
     telegramReporter,
-    walleyRefundBridge
+    walleyRefundBridge,
+    accountSnapshots: persistedAccountSnapshots
   } = context;
 
   const cycleStartTime = new Date();
@@ -9549,11 +9858,9 @@ async function runDailyCycle(context) {
     );
   }
   
-  // Reset round-robin offset untuk daily cycle baru
+  // Reset round-robin offset untuk hourly cycle baru
   resetRoundRobinOffset();
-  
-  // Reset global TX stats untuk daily cycle baru
-  resetGlobalTxStats();
+  ensureTxStatsCurrentUtcDay();
   
   // Clean up expired reciprocal cooldown state from previous runs
   cleanupExpiredSendPairs();
@@ -9567,7 +9874,7 @@ async function runDailyCycle(context) {
   );
   
   console.log(`\n${"#".repeat(70)}`);
-  console.log(`[cycle] Loop cycle started at ${formatUTCTime(cycleStartTime)}`);
+  console.log(`[cycle] Hourly cycle started at ${formatUTCTime(cycleStartTime)}`);
   console.log(`[cycle] Mode: ${sendMode} | Accounts: ${sortedAccounts.length}`);
   if (sendMode === "internal" || sendMode === "hybrid") {
     console.log(`[internal] Strategy: COVERAGE-FIRST SHUFFLED QUEUES + COOLDOWN-AWARE FALLBACK`);
@@ -9581,8 +9888,16 @@ async function runDailyCycle(context) {
 
   const results = [];
   const totalAccounts = sortedAccounts.length;
-  const configuredMaxLoopTx = clampToNonNegativeInt(config.send.maxLoopTx || config.send.maxTx, 1);
-  const totalLoopRounds = sendMode === "balance-only" ? 1 : configuredMaxLoopTx;
+  const configuredMaxTransfersPerHour = Math.max(
+    1,
+    clampToNonNegativeInt(
+      Object.prototype.hasOwnProperty.call(config.send, "maxTransfersPerHour")
+        ? config.send.maxTransfersPerHour
+        : INTERNAL_API_DEFAULTS.send.maxTransfersPerHour,
+      INTERNAL_API_DEFAULTS.send.maxTransfersPerHour
+    )
+  );
+  const totalLoopRounds = sendMode === "balance-only" ? 1 : configuredMaxTransfersPerHour;
   
   // Parallel jitter: random delay for each account before starting (staggered start)
   // This prevents all accounts hitting the server at exact same millisecond
@@ -9608,6 +9923,33 @@ async function runDailyCycle(context) {
   );
   const parallelJitterMinSec = Math.min(minParallelJitterSec, maxParallelJitterSec);
   const parallelJitterMaxSec = Math.max(minParallelJitterSec, maxParallelJitterSec);
+  const workerCount = Math.max(
+    1,
+    clampToNonNegativeInt(
+      Object.prototype.hasOwnProperty.call(config.send, "workers")
+        ? config.send.workers
+        : INTERNAL_API_DEFAULTS.send.workers,
+      INTERNAL_API_DEFAULTS.send.workers
+    )
+  );
+  const maxDeferredWaitSeconds = Math.max(
+    1,
+    clampToNonNegativeInt(
+      Object.prototype.hasOwnProperty.call(config.send, "maxDeferredWaitSeconds")
+        ? config.send.maxDeferredWaitSeconds
+        : INTERNAL_API_DEFAULTS.send.maxDeferredWaitSeconds,
+      INTERNAL_API_DEFAULTS.send.maxDeferredWaitSeconds
+    )
+  );
+  const softRestartRetryAfterSeconds = Math.max(
+    15,
+    clampToNonNegativeInt(
+      config.session && Object.prototype.hasOwnProperty.call(config.session, "softRestartRetryAfterSeconds")
+        ? config.session.softRestartRetryAfterSeconds
+        : INTERNAL_API_DEFAULTS.session.softRestartRetryAfterSeconds,
+      INTERNAL_API_DEFAULTS.session.softRestartRetryAfterSeconds
+    )
+  );
   
   // Round delay: fixed delay between rounds
   const delayRoundSec = clampToNonNegativeInt(
@@ -9619,7 +9961,8 @@ async function runDailyCycle(context) {
       ? config.send.sequentialAllRounds
       : INTERNAL_API_DEFAULTS.send.sequentialAllRounds;
   
-  const accountSnapshots = {};
+  const accountSnapshots = isObject(persistedAccountSnapshots) ? persistedAccountSnapshots : {};
+  context.accountSnapshots = accountSnapshots;
   const roundDeferPollSeconds = TX_RETRY_INITIAL_DELAY_SECONDS;
   const SMART_FILL_RETRY_DELAY_SECONDS = 20;
   const SMART_FILL_MAX_ATTEMPTS_PER_ROUND = 2;
@@ -9631,13 +9974,20 @@ async function runDailyCycle(context) {
   if (sendMode === "internal" || sendMode === "hybrid") {
     console.log(`[internal] Base account order: ${ringOrderLabel}`);
   }
-  console.log(`[cycle] Loop rounds: ${totalLoopRounds} (maxLoopTx=${configuredMaxLoopTx})`);
+  console.log(
+    `[cycle] Loop rounds: ${totalLoopRounds} (maxTransfersPerHour=${configuredMaxTransfersPerHour})`
+  );
   if (forceSequentialAllRounds) {
-    console.log("[cycle] Execution mode: sequential all rounds (parallel disabled)");
+    console.log("[cycle] Execution mode: sequential all rounds (worker mode disabled)");
   } else {
-    console.log(`[cycle] Parallel jitter: ${parallelJitterMinSec}-${parallelJitterMaxSec}s per account`);
+    console.log(
+      `[cycle] Worker mode: round 1 sequential, next rounds workers=${workerCount} ` +
+      `(batch jitter ${parallelJitterMinSec}-${parallelJitterMaxSec}s)`
+    );
   }
-  console.log(`[cycle] Round delay: ${delayRoundSec}s between rounds\n`);
+  console.log(
+    `[cycle] Round delay: ${delayRoundSec}s between rounds | max deferred wait: ${maxDeferredWaitSeconds}s | soft restart retry: ${softRestartRetryAfterSeconds}s\n`
+  );
 
   for (let roundIndex = 0; roundIndex < totalLoopRounds; roundIndex += 1) {
     const loopRound = roundIndex + 1;
@@ -9652,7 +10002,7 @@ async function runDailyCycle(context) {
     const isSequentialRound = forceSequentialAllRounds || (loopRound === 1);
     const executionMode = isSequentialRound
       ? (forceSequentialAllRounds ? "SEQUENTIAL (all rounds)" : "SEQUENTIAL (auth/OTP)")
-      : "PARALLEL";
+      : `WORKERS x${workerCount}`;
     
     console.log(`\n[cycle] Round ${loopRound}/${totalLoopRounds} started (${executionMode})`);
 
@@ -9674,6 +10024,25 @@ async function runDailyCycle(context) {
 
       if (carryOverState) {
         carryOverDeferStateByAccount.delete(account.name);
+      }
+
+      if (sendMode !== "balance-only" && hasReachedAccountHourlyTxCap(config, account.name)) {
+        const cap = getAccountHourlyTxCap(config);
+        const hourlyStats = getPerAccountHourlyTxStats(account.name);
+        console.log(
+          `[cap] Skip ${account.name}: hourly cap reached ${hourlyStats.total}/${cap}`
+        );
+        continue;
+      }
+
+      if (sendMode !== "balance-only" && hasReachedAccountTierDailyTxCap(config, account.name)) {
+        const cap = getAccountTierDailyTxCap(config, account.name);
+        const tierKey = getAccountTierKey(account.name);
+        const stats = getPerAccountTxStats(account.name);
+        console.log(
+          `[cap] Skip ${account.name}: daily tier cap reached ${stats.total}/${cap} (${tierKey})`
+        );
+        continue;
       }
 
       pendingEntries.push({
@@ -9699,6 +10068,14 @@ async function runDailyCycle(context) {
         `${internalNames.length} internal [${internalNames.join(", ")}]`
       );
     }
+
+    if (pendingEntries.length === 0) {
+      console.log(
+        `[cycle] Round ${loopRound}/${totalLoopRounds} skipped: all accounts already reached hourly or daily caps`
+      );
+      break;
+    }
+
     let deferPassCount = 0;
 
     while (pendingEntries.length > 0) {
@@ -9721,7 +10098,10 @@ async function runDailyCycle(context) {
           Number.MAX_SAFE_INTEGER
         );
         const waitMs = Math.max(0, nearestReadyMs - nowMs);
-        const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
+        const waitSeconds = Math.min(
+          maxDeferredWaitSeconds,
+          Math.max(1, Math.ceil(waitMs / 1000))
+        );
         const waitingNames = delayedEntries.map((entry) => entry.account.name).join(", ");
         console.log(
           `[cycle] Round ${loopRound}/${totalLoopRounds} waiting ${waitSeconds}s for deferred accounts: ${waitingNames}`
@@ -9772,198 +10152,130 @@ async function runDailyCycle(context) {
         }
       }
 
-      // ========================================================================
-      // EXECUTION MODE: Sequential for Round 1, Parallel for Round 2+
-      // ========================================================================
-      
       let roundResults = [];
-      
-      if (isSequentialRound) {
-        // ====================================================================
-        // SEQUENTIAL EXECUTION (Round 1): Process accounts one by one
-        // This allows proper OTP input without prompts overlapping
-        // ====================================================================
-        const sequentialAccounts = executionEntries.map((e) => e.account.name).join(" -> ");
-        console.log(`[sequential] Processing ${executionEntries.length} accounts one by one: ${sequentialAccounts}`);
-        
-        for (let i = 0; i < executionEntries.length; i++) {
-          const entry = executionEntries[i];
-          const account = entry.account;
-          const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
-          tokens.accounts[account.name] = accountToken;
+      const runOneEntry = async (entry, indexInRound) => {
+        const account = entry.account;
+        const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
+        tokens.accounts[account.name] = accountToken;
 
-          console.log(`[sequential] [${i + 1}/${executionEntries.length}] Processing ${account.name}...`);
-
-          try {
-            const result = await processAccount({
-              account,
-              accountToken,
-              config,
-              tokens,
-              tokensPath,
-              sendMode,
-              recipientsInfo,
-              args,
-              accountIndex: i,
-              totalAccounts,
-              selectedAccounts: sortedAccounts,
-              accountSnapshots,
-              telegramReporter,
-              walleyRefundBridge,
-              loopRound,
-              totalLoopRounds,
-              hybridAssignedMode:
-                sendMode === "hybrid" && hybridRoundAssignments && hybridRoundAssignments.externalNames.has(account.name)
-                  ? "external"
-                  : (sendMode === "hybrid" ? "internal" : null),
-              deferWalleyRefundsToRoundLevel: true,
-              maxLoopTxOverride: sendMode === "balance-only" ? null : 1,
-              smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
-                ? entry.smartFillBlockRecipients
-                : [],
-              resumeFromDeferReason: entry.deferReason || "",
-              preferredInternalRecipients: Array.isArray(entry.preferredInternalRecipients)
-                ? entry.preferredInternalRecipients
-                : [],
-              plannedInternalAmount: entry.plannedInternalAmount || null
-            });
-            roundResults.push({ entry, result, error: null });
-          } catch (error) {
-            // Check if this is a soft restart error (consecutive timeouts)
-            const isSoftRestart = error && error.isSoftRestart;
-            if (isSoftRestart) {
-              console.log(
-                `[soft-restart] ${account.name} triggered soft restart due to consecutive timeouts. ` +
-                `Resetting connection pool and deferring to next round...`
-              );
-              
-              // Reset connection pool to clear stuck connections
-              await resetConnectionPool();
-              
-              // Defer with longer delay (120s) to allow connection reset to take effect
-              roundResults.push({ 
-                entry, 
-                result: { 
-                  success: false, 
-                  account: account.name,
-                  deferred: true,
-                  deferReason: "soft-restart-timeout",
-                  deferRetryAfterSeconds: 120 // Retry after 120s (longer for recovery)
-                }, 
-                error: null,
-                softRestart: true
-              });
-            } else {
-              console.error(`[error] Round ${loopRound}/${totalLoopRounds} | Account ${account.name}: ${error.message}`);
-              roundResults.push({ 
-                entry, 
-                result: { success: false, account: account.name }, 
-                error: error.message 
-              });
-            }
+        try {
+          const result = await processAccount({
+            account,
+            accountToken,
+            config,
+            tokens,
+            tokensPath,
+            sendMode,
+            recipientsInfo,
+            args,
+            accountIndex: indexInRound,
+            totalAccounts,
+            selectedAccounts: sortedAccounts,
+            accountSnapshots,
+            telegramReporter,
+            walleyRefundBridge,
+            loopRound,
+            totalLoopRounds,
+            hybridAssignedMode:
+              sendMode === "hybrid" && hybridRoundAssignments && hybridRoundAssignments.externalNames.has(account.name)
+                ? "external"
+                : (sendMode === "hybrid" ? "internal" : null),
+            deferWalleyRefundsToRoundLevel: true,
+            maxLoopTxOverride: sendMode === "balance-only" ? null : 1,
+            smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
+              ? entry.smartFillBlockRecipients
+              : [],
+            resumeFromDeferReason: entry.deferReason || "",
+            preferredInternalRecipients: Array.isArray(entry.preferredInternalRecipients)
+              ? entry.preferredInternalRecipients
+              : [],
+            plannedInternalAmount: entry.plannedInternalAmount || null
+          });
+          return { entry, result, error: null };
+        } catch (error) {
+          const isSoftRestart = error && error.isSoftRestart;
+          if (isSoftRestart) {
+            console.log(
+              `[soft-restart] ${account.name} triggered soft restart due to consecutive timeouts. ` +
+              `Resetting connection pool and deferring retry for ${softRestartRetryAfterSeconds}s...`
+            );
+            await resetConnectionPool();
+            return {
+              entry,
+              result: {
+                success: false,
+                account: account.name,
+                deferred: true,
+                deferReason: "soft-restart-timeout",
+                deferRetryAfterSeconds: softRestartRetryAfterSeconds
+              },
+              error: null,
+              softRestart: true
+            };
           }
 
-          // Small delay between sequential accounts (not the full jitter)
-          if (i < executionEntries.length - 1 && !args.dryRun) {
-            const seqDelaySec = 2; // 2 seconds between sequential accounts
+          console.error(`[error] Round ${loopRound}/${totalLoopRounds} | Account ${account.name}: ${error.message}`);
+          return {
+            entry,
+            result: { success: false, account: account.name },
+            error: error.message
+          };
+        }
+      };
+
+      if (isSequentialRound || workerCount <= 1) {
+        const sequentialAccounts = executionEntries.map((item) => item.account.name).join(" -> ");
+        console.log(
+          `[sequential] Processing ${executionEntries.length} accounts one by one: ${sequentialAccounts}`
+        );
+
+        for (let index = 0; index < executionEntries.length; index += 1) {
+          const entry = executionEntries[index];
+          console.log(
+            `[sequential] [${index + 1}/${executionEntries.length}] Processing ${entry.account.name}...`
+          );
+          roundResults.push(await runOneEntry(entry, index));
+
+          if (index < executionEntries.length - 1 && !args.dryRun) {
+            const seqDelaySec = 2;
             console.log(`[sequential] Waiting ${seqDelaySec}s before next account...`);
             await sleep(seqDelaySec * 1000);
           }
         }
       } else {
-        // ====================================================================
-        // PARALLEL EXECUTION (Round 2+): All accounts send with staggered jitter
-        // Sessions should already be established from Round 1
-        // ====================================================================
-        const parallelAccounts = executionEntries.map((e) => e.account.name).join(", ");
-        console.log(`[parallel] Executing ${executionEntries.length} accounts with jitter ${parallelJitterMinSec}-${parallelJitterMaxSec}s: ${parallelAccounts}`);
-        
-        const accountPromises = executionEntries.map(async (entry, i) => {
-          const account = entry.account;
-          const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
-          tokens.accounts[account.name] = accountToken;
+        const batches = [];
+        for (let startIndex = 0; startIndex < executionEntries.length; startIndex += workerCount) {
+          batches.push(executionEntries.slice(startIndex, startIndex + workerCount));
+        }
 
-          // Apply random jitter before starting this account (staggered parallel)
-          if (!args.dryRun && parallelJitterMaxSec > 0) {
-            const jitterSec = randomIntInclusive(parallelJitterMinSec, parallelJitterMaxSec);
-            if (jitterSec > 0) {
-              console.log(`[parallel] ${account.name} waiting ${jitterSec}s jitter before start`);
-              await sleep(jitterSec * 1000);
-            }
-          }
+        const readyOrderLabel = executionEntries.map((item) => item.account.name).join(" -> ");
+        console.log(
+          `[workers] Processing ${executionEntries.length} accounts in ${batches.length} batch(es) ` +
+          `(workers=${workerCount}): ${readyOrderLabel}`
+        );
 
-          try {
-            const result = await processAccount({
-              account,
-              accountToken,
-              config,
-              tokens,
-              tokensPath,
-              sendMode,
-              recipientsInfo,
-              args,
-              accountIndex: i,
-              totalAccounts,
-              selectedAccounts: sortedAccounts,
-              accountSnapshots,
-              telegramReporter,
-              walleyRefundBridge,
-              loopRound,
-              totalLoopRounds,
-              hybridAssignedMode:
-                sendMode === "hybrid" && hybridRoundAssignments && hybridRoundAssignments.externalNames.has(account.name)
-                  ? "external"
-                  : (sendMode === "hybrid" ? "internal" : null),
-              deferWalleyRefundsToRoundLevel: true,
-              maxLoopTxOverride: sendMode === "balance-only" ? null : 1,
-              smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
-                ? entry.smartFillBlockRecipients
-                : [],
-              resumeFromDeferReason: entry.deferReason || "",
-              preferredInternalRecipients: Array.isArray(entry.preferredInternalRecipients)
-                ? entry.preferredInternalRecipients
-                : [],
-              plannedInternalAmount: entry.plannedInternalAmount || null
-            });
-            return { entry, result, error: null };
-          } catch (error) {
-            // Check if this is a soft restart error (consecutive timeouts)
-            const isSoftRestart = error && error.isSoftRestart;
-            if (isSoftRestart) {
+        let processedCount = 0;
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+          const batch = batches[batchIndex];
+          const batchNames = batch.map((item) => item.account.name).join(", ");
+          console.log(`[workers] Batch ${batchIndex + 1}/${batches.length}: ${batchNames}`);
+
+          const batchResults = await Promise.all(
+            batch.map((entry, indexInBatch) => runOneEntry(entry, processedCount + indexInBatch))
+          );
+          roundResults.push(...batchResults);
+          processedCount += batch.length;
+
+          if (batchIndex < batches.length - 1 && !args.dryRun && parallelJitterMaxSec > 0) {
+            const batchJitterSec = randomIntInclusive(parallelJitterMinSec, parallelJitterMaxSec);
+            if (batchJitterSec > 0) {
               console.log(
-                `[soft-restart] ${account.name} triggered soft restart due to consecutive timeouts. ` +
-                `Resetting connection pool and deferring to next round...`
+                `[workers] Waiting ${batchJitterSec}s before next worker batch...`
               );
-              
-              // Reset connection pool to clear stuck connections
-              await resetConnectionPool();
-              
-              // Defer with longer delay (120s) to allow connection reset to take effect
-              return { 
-                entry, 
-                result: { 
-                  success: false, 
-                  account: account.name,
-                  deferred: true,
-                  deferReason: "soft-restart-timeout",
-                  deferRetryAfterSeconds: 120 // Retry after 120s (longer for recovery)
-                }, 
-                error: null,
-                softRestart: true
-              };
-            } else {
-              console.error(`[error] Round ${loopRound}/${totalLoopRounds} | Account ${account.name}: ${error.message}`);
-              return { 
-                entry, 
-                result: { success: false, account: account.name }, 
-                error: error.message 
-              };
+              await sleep(batchJitterSec * 1000);
             }
           }
-        });
-        
-        // Wait for all parallel executions to complete
-        roundResults = await Promise.all(accountPromises);
+        }
       }
 
       await processWalleyRefundsForRoundPass(
@@ -10157,7 +10469,10 @@ async function runDailyCycle(context) {
           return Math.min(minValue, candidate);
         }, Number.MAX_SAFE_INTEGER);
         const waitMs = Math.max(0, nearestReadyMs - nowAfterPassMs);
-        const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
+        const waitSeconds = Math.min(
+          maxDeferredWaitSeconds,
+          Math.max(1, Math.ceil(waitMs / 1000))
+        );
         console.log(
           `[cycle] Round ${loopRound}/${totalLoopRounds} has no send progress. Waiting ${waitSeconds}s before retrying deferred accounts...`
         );
@@ -10352,10 +10667,15 @@ async function run() {
     args,
     legacyCookies,
     telegramReporter,
-    walleyRefundBridge
+    walleyRefundBridge,
+    accountSnapshots: {}
   };
 
-  // Daily loop
+  if (!args.dryRun) {
+    await runStartupBalanceWarmup(cycleContext);
+  }
+
+  // Hourly loop
   let cycleCount = 0;
   const maxConsecutiveErrors = 3;
   let consecutiveErrors = 0;
@@ -10376,20 +10696,24 @@ async function run() {
         cycleContext.tokens.accounts[accountEntry.name] = profile;
       }
 
-      // Run the daily cycle
+      // Run the hourly cycle
       const cycleResult = await runDailyCycle(cycleContext);
       
       // Reset consecutive errors on success
       consecutiveErrors = 0;
 
-      // Calculate time until next cycle (24 hours from cycle start, or next midnight UTC)
+      if (args.dryRun) {
+        break;
+      }
+
+      // Calculate time until next cycle (next UTC hour)
       const now = new Date();
-      const nextCycleTime = getNextMidnightUTC();
+      const nextCycleTime = getNextHourUTC(now);
       const waitMs = Math.max(0, nextCycleTime - now);
       
-      if (waitMs > 0 && !args.dryRun) {
+      if (waitMs > 0) {
         console.log(`\n${"=".repeat(70)}`);
-        console.log(`[cycle] Daily cycle #${cycleCount} completed!`);
+        console.log(`[cycle] Hourly cycle #${cycleCount} completed!`);
         console.log(`[cycle] Results: ${cycleResult.successful.length} successful, ${cycleResult.failed.length} failed`);
         console.log(`[cycle] Duration: ${formatDuration(cycleResult.cycleDuration)}`);
         console.log(`[cycle] Next cycle at: ${formatUTCTime(nextCycleTime)}`);
@@ -10403,7 +10727,7 @@ async function run() {
               "Status: WAITING",
               `Cycle #: ${cycleCount}`,
               `Result: ${cycleResult.successful.length} successful | ${cycleResult.failed.length} failed`,
-              `Next cycle: ${formatUTCTime(nextCycleTime)}`,
+              `Next hour cycle: ${formatUTCTime(nextCycleTime)}`,
               `Waiting: ${formatDuration(waitMs)}`
             ].join("\n"),
             { immediate: true }

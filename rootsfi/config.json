@@ -1,12 +1,21 @@
 {
   "send": {
-    "maxLoopTx": 100,
+    "maxTransfersPerHour": 2,
     "minDelayTxSeconds": 300,
     "maxDelayTxSeconds": 1200,
     "parallelJitterMinSeconds": 1,
     "parallelJitterMaxSeconds": 10,
-    "delayCycleSeconds": 3000,
-    "sequentialAllRounds": true,
+    "delayCycleSeconds": 1800,
+    "sequentialAllRounds": false,
+    "workers": 2,
+    "maxDeferredWaitSeconds": 45,
+    "tierDailyTxCap": {
+      "unranked": 96,
+      "newbie": 120,
+      "advanced": 180,
+      "pro": 240,
+      "elite": 360
+    },
     "tierAmounts": {
       "unranked": {
         "min": "25",
@@ -45,6 +54,7 @@
   "session": {
     "proactiveVercelRefreshMinutes": 0,
     "browserChallengeRetryAfterSeconds": 120,
+    "softRestartRetryAfterSeconds": 45,
     "maxSessionReuseTransientAttempts": 3,
     "maxSessionReuseTransientBrowserRefreshes": 2,
     "transientBrowserRefreshTriggerFailures": 1,
@@ -57,8 +67,8 @@
     "logLines": 20
   },
   "safety": {
-    "minScoreThreshold": 40,
-    "minHoldBalanceCc": 200
+    "minScoreThreshold": 50,
+    "minHoldBalanceCc": 10
   },
   "telegram": {
     "enabled": false,
