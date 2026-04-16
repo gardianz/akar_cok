@@ -761,6 +761,15 @@ function buildInternalSendRequests(
   const amount = fixedAmountInput
     ? normalizeCcAmount(fixedAmountInput)
     : generateRandomCcAmount(senderRange, senderTierKey);
+  const preferredOrder = Array.isArray(preferredRecipientNames)
+    ? preferredRecipientNames.map((name) => String(name || "").trim()).filter(Boolean)
+    : [];
+  const preferredIndex = new Map();
+  preferredOrder.forEach((name, index) => {
+    if (!preferredIndex.has(name)) {
+      preferredIndex.set(name, index);
+    }
+  });
   const primaryOffset = getRotatingOffset(sortedAccounts.length, loopRound);
   const offsetPriority = buildInternalOffsetPriority(sortedAccounts.length, primaryOffset);
   const requests = [];
@@ -801,30 +810,25 @@ function buildInternalSendRequests(
     });
   }
 
-  const preferSet = new Set(
-    Array.isArray(preferredRecipientNames)
-      ? preferredRecipientNames.map((name) => String(name || "").trim()).filter(Boolean)
-      : []
-  );
-  if (preferSet.size > 0 && requests.length > 1) {
-    const preferred = [];
-    const others = [];
-    for (const request of requests) {
-      if (preferSet.has(request.label)) {
-        preferred.push(request);
-      } else {
-        others.push(request);
+  const preferSet = new Set(preferredOrder);
+  if (preferSet.size > 0 && requests.length > 0) {
+    requests.sort((left, right) => {
+      const leftPreferred = preferSet.has(left.label);
+      const rightPreferred = preferSet.has(right.label);
+      if (leftPreferred !== rightPreferred) {
+        return leftPreferred ? -1 : 1;
       }
-    }
-    if (preferred.length > 0) {
-      const shuffledPreferred = preferred.length > 1 ? shuffleArray(preferred) : preferred;
-      const shuffledOthers = others.length > 1 ? shuffleArray(others) : others;
-      requests.length = 0;
-      requests.push(...shuffledPreferred, ...shuffledOthers);
-      if (!quiet) {
+      if (leftPreferred && rightPreferred) {
+        return Number(preferredIndex.get(left.label) || 0) - Number(preferredIndex.get(right.label) || 0);
+      }
+      return 0;
+    });
+    if (!quiet) {
+      const matched = requests.filter((item) => preferSet.has(item.label)).map((item) => item.label);
+      if (matched.length > 0) {
         console.log(
-          `[internal] Prefer recipients for ${senderName}: [${[...preferSet].join(", ")}] ` +
-          `matched=${preferred.map((item) => item.label).join(", ")}`
+          `[internal] Prefer recipients for ${senderName}: [${preferredOrder.join(", ")}] ` +
+          `matched=${matched.join(", ")}`
         );
       }
     }
@@ -2865,6 +2869,17 @@ function randomIntInclusive(min, max) {
   return Math.floor(Math.random() * (hi - lo + 1)) + lo;
 }
 
+function humanLikeDelay(minSec, maxSec) {
+  const range = maxSec - minSec;
+  if (range <= 0) {
+    return Math.round(minSec);
+  }
+  const r1 = Math.random();
+  const r2 = Math.random();
+  const centered = (r1 + r2) / 2;
+  return Math.round(minSec + (centered * range));
+}
+
 function shuffleArray(items) {
   const array = Array.isArray(items) ? [...items] : [];
   for (let i = array.length - 1; i > 0; i -= 1) {
@@ -4099,38 +4114,173 @@ function logBalanceDistribution(accountNames, roundLabel, accountSnapshots = {})
   );
 }
 
-function computeRoundSendPlan(sortedAccounts, accountSnapshots = {}) {
-  const safeAccounts = Array.isArray(sortedAccounts) ? sortedAccounts : [];
-  const plan = new Map();
-  const accountNames = safeAccounts.map((account) => String(account && account.name ? account.name : "").trim()).filter(Boolean);
-  const dist = computeBalanceDistribution(accountNames, accountSnapshots);
+function sortChainCandidates(candidateNames, projectedBalances, accountTxStats) {
+  return [...candidateNames].sort((left, right) => {
+    const leftBalance = Number(projectedBalances.get(left));
+    const rightBalance = Number(projectedBalances.get(right));
+    const leftKey = Number.isFinite(leftBalance) ? leftBalance : Number.POSITIVE_INFINITY;
+    const rightKey = Number.isFinite(rightBalance) ? rightBalance : Number.POSITIVE_INFINITY;
+    if (leftKey !== rightKey) {
+      return leftKey - rightKey;
+    }
 
-  if (dist.tracked < 2 || dist.deficit.length === 0 || dist.surplus.length === 0) {
+    const leftTx = Number(accountTxStats.get(left) || 0);
+    const rightTx = Number(accountTxStats.get(right) || 0);
+    if (leftTx !== rightTx) {
+      return leftTx - rightTx;
+    }
+
+    return left.localeCompare(right);
+  });
+}
+
+function buildChainRecipientPriority(senderName, allNames, unsentNames, projectedBalances, accountTxStats) {
+  const sender = String(senderName || "").trim();
+  const unsentPool = sortChainCandidates(
+    Array.from(unsentNames).filter((name) => name && name !== sender),
+    projectedBalances,
+    accountTxStats
+  );
+  const remainingPool = sortChainCandidates(
+    allNames.filter((name) => name && name !== sender && !unsentNames.has(name)),
+    projectedBalances,
+    accountTxStats
+  );
+
+  const ordered = [];
+  for (const candidate of [...unsentPool, ...remainingPool]) {
+    if (!ordered.includes(candidate)) {
+      ordered.push(candidate);
+    }
+  }
+
+  if (ordered.length <= 1) {
+    return ordered;
+  }
+
+  const unlocked = ordered.filter((candidate) => getReciprocalCooldownSeconds(sender, candidate) <= 0);
+  const blocked = ordered.filter((candidate) => getReciprocalCooldownSeconds(sender, candidate) > 0);
+  return [...unlocked, ...blocked];
+}
+
+function computeRoundSendPlan(sortedAccounts, accountSnapshots = {}, sendPolicy = {}, config = {}) {
+  const safeAccounts = Array.isArray(sortedAccounts)
+    ? sortedAccounts.filter((account) => {
+        const name = String(account && account.name ? account.name : "").trim();
+        const address = String(account && account.address ? account.address : "").trim();
+        return Boolean(name) && Boolean(address) && !isAccountQuarantined(name);
+      })
+    : [];
+  const plan = new Map();
+  if (safeAccounts.length < 2) {
     return plan;
   }
 
-  const surplusSenders = dist.surplus.map((entry) => entry.name);
-  const deficitRecipients = dist.deficit.map((entry) => entry.name);
-  const assignedRecipients = new Set();
+  const holdBalance = Math.max(
+    0,
+    Number(
+      isObject(config) && isObject(config.safety)
+        ? config.safety.minHoldBalanceCc
+        : INTERNAL_API_DEFAULTS.safety.minHoldBalanceCc
+    ) || 0
+  );
+  const allNames = safeAccounts.map((account) => String(account.name || "").trim()).filter(Boolean);
+  const accountByName = new Map(safeAccounts.map((account) => [String(account.name || "").trim(), account]));
+  const projectedBalances = new Map();
+  const accountTxStats = new Map();
 
-  for (const senderName of surplusSenders) {
-    for (const recipientName of deficitRecipients) {
-      if (assignedRecipients.has(recipientName)) continue;
-      if (senderName === recipientName) continue;
-      if (getReciprocalCooldownSeconds(senderName, recipientName) > 0) continue;
-      plan.set(senderName, [recipientName]);
-      assignedRecipients.add(recipientName);
-      break;
-    }
+  for (const name of allNames) {
+    projectedBalances.set(name, getPlanningCcBalance(name, accountSnapshots, 0));
+    accountTxStats.set(name, getPerAccountTxStats(name).ok);
   }
 
-  if (plan.size > 0) {
-    const assignments = [];
-    for (const [sender, recipients] of plan.entries()) {
-      assignments.push(`${sender}->${recipients[0]}`);
+  const sortedByBalanceDesc = [...allNames].sort((left, right) => {
+    const leftBalance = Number(projectedBalances.get(left));
+    const rightBalance = Number(projectedBalances.get(right));
+    if (leftBalance !== rightBalance) {
+      return rightBalance - leftBalance;
     }
+    const leftTx = Number(accountTxStats.get(left) || 0);
+    const rightTx = Number(accountTxStats.get(right) || 0);
+    if (leftTx !== rightTx) {
+      return leftTx - rightTx;
+    }
+    return left.localeCompare(right);
+  });
+
+  const unsentNames = new Set(allNames);
+  let currentSender = sortedByBalanceDesc[0] || "";
+  const planParts = [];
+
+  while (unsentNames.size > 0) {
+    if (!unsentNames.has(currentSender)) {
+      currentSender = [...unsentNames].sort((left, right) => {
+        const leftBalance = Number(projectedBalances.get(left));
+        const rightBalance = Number(projectedBalances.get(right));
+        if (leftBalance !== rightBalance) {
+          return rightBalance - leftBalance;
+        }
+        return left.localeCompare(right);
+      })[0] || "";
+    }
+    if (!currentSender) {
+      break;
+    }
+
+    unsentNames.delete(currentSender);
+    const preferredRecipients = buildChainRecipientPriority(
+      currentSender,
+      allNames,
+      unsentNames,
+      projectedBalances,
+      accountTxStats
+    );
+    const primaryRecipient = String(preferredRecipients[0] || "").trim();
+    const senderProjectedBalance = Number(projectedBalances.get(currentSender));
+    const senderSpendable = Number.isFinite(senderProjectedBalance)
+      ? Math.max(0, senderProjectedBalance - holdBalance)
+      : 0;
+    let plannedAmount = generateTierBalancedAmount(sendPolicy, currentSender, senderSpendable);
+    const tierMinimumAmount = getTierMinimumAmountForSender(sendPolicy, currentSender);
+    if (plannedAmount) {
+      const numericAmount = Number(plannedAmount);
+      if (!Number.isFinite(numericAmount) || numericAmount < tierMinimumAmount) {
+        plannedAmount = null;
+      }
+    }
+
+    plan.set(currentSender, {
+      preferredRecipients,
+      plannedAmount,
+      projectedBalance: senderProjectedBalance
+    });
+
+    if (primaryRecipient) {
+      const numericAmount = Number(plannedAmount);
+      if (Number.isFinite(numericAmount)) {
+        const senderNext = Number(projectedBalances.get(currentSender));
+        const recipientNext = Number(projectedBalances.get(primaryRecipient));
+        if (Number.isFinite(senderNext)) {
+          projectedBalances.set(currentSender, senderNext - numericAmount);
+        }
+        if (Number.isFinite(recipientNext)) {
+          projectedBalances.set(primaryRecipient, recipientNext + numericAmount);
+        }
+      }
+      planParts.push(
+        `${currentSender}->${primaryRecipient}${plannedAmount ? `(${plannedAmount} CC)` : ""}`
+      );
+      currentSender = primaryRecipient;
+      continue;
+    }
+
+    planParts.push(`${currentSender}->(none)`);
+    currentSender = "";
+  }
+
+  if (planParts.length > 0) {
     console.log(
-      `[balance-smart] Round plan (${plan.size} pair${plan.size > 1 ? "s" : ""}): ${assignments.join(", ")}`
+      `[internal-chain] Round plan (${planParts.length} send${planParts.length > 1 ? "s" : ""}): ${planParts.join(" | ")}`
     );
   }
 
@@ -9294,13 +9444,13 @@ async function processAccount(context) {
             send: `Deferred internal send for ${retryAfterSeconds}s`,
             transfer: "deferred (internal-recipient)",
             cooldown: `${retryAfterSeconds}s`,
-            mode: "internal-coverage"
+            mode: "internal-chain"
           });
 
           buildDeferResult = {
             success: true,
             account: account.name,
-            mode: "internal-rotating-deferred",
+            mode: "internal-chain-deferred",
             deferred: true,
             deferReason,
             deferRetryAfterSeconds: retryAfterSeconds,
@@ -9318,11 +9468,11 @@ async function processAccount(context) {
         const fallbackLabel = fallbackCount > 0 ? ` (+${fallbackCount} fallback)` : "";
         dashboard.setState({
           send: `${primaryRequest.amount} CC -> ${primaryRequest.label}${fallbackLabel}`,
-          mode: "internal-rotating"
+          mode: "internal-chain"
         });
         console.log(
-          `[init] Send plan (internal-rotating): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
-            `${fallbackLabel} | preferred-offset=${internalPlan.primaryOffset} | tier=${senderTierKey} (${senderTierAmountLabel})`
+          `[init] Send plan (internal-chain): ${primaryRequest.amount} CC -> ${primaryRequest.label}` +
+            `${fallbackLabel} | tier=${senderTierKey} (${senderTierAmountLabel})`
         );
         return;
       }
@@ -10195,8 +10345,8 @@ async function runDailyCycle(context) {
   console.log(`[cycle] Hourly cycle started at ${formatUTCTime(cycleStartTime)}`);
   console.log(`[cycle] Mode: ${sendMode} | Accounts: ${sortedAccounts.length}`);
   if (sendMode === "internal" || sendMode === "hybrid") {
-    console.log(`[internal] Strategy: ROTATING OFFSET + TX/BALANCE PRIORITY + COOLDOWN-AWARE FALLBACK`);
-    console.log(`[internal] Goal: round offset +1, recipient priority follows lagging TX and low balance`);
+    console.log(`[internal] Strategy: BALANCE CHAIN (largest -> smallest, recipient continues chain)`);
+    console.log(`[internal] Goal: every active account sends once per round while re-feeding the lowest balance`);
     console.log(`[internal] Guard: no direct send-back to previous sender for >=10 minutes`);
   }
   if (sendMode === "hybrid") {
@@ -10313,7 +10463,7 @@ async function runDailyCycle(context) {
     console.log("[cycle] Execution mode: sequential all rounds (worker mode disabled)");
   } else {
     console.log(
-      `[cycle] Worker mode: round 1 sequential, next rounds workers=${workerCount} ` +
+      `[cycle] Worker mode: workers=${workerCount} ` +
       `(delay between batches ${accountDelayMinSec}-${accountDelayMaxSec}s)`
     );
   }
@@ -10324,17 +10474,11 @@ async function runDailyCycle(context) {
   for (let roundIndex = 0; roundIndex < totalLoopRounds; roundIndex += 1) {
     const loopRound = roundIndex + 1;
     
-    // Increment round offset seed used by internal rotating recipient planner.
-    incrementRoundRobinOffset();
-    
     const maxDeferPassesPerRound = Math.max(3, sortedAccounts.length * 4);
     
-    // Sequential mode can be forced for all rounds to reduce server pressure.
-    // If disabled, round 1 stays sequential and round 2+ runs in parallel.
-    const isSequentialRound = forceSequentialAllRounds || (loopRound === 1);
-    const executionMode = isSequentialRound
-      ? (forceSequentialAllRounds ? "SEQUENTIAL (all rounds)" : "SEQUENTIAL (auth/OTP)")
-      : `WORKERS x${workerCount}`;
+    const effectiveWorkerCount = forceSequentialAllRounds ? 1 : workerCount;
+    const executionMode =
+      effectiveWorkerCount > 1 ? `WORKERS x${effectiveWorkerCount}` : "SEQUENTIAL";
     
     console.log(`\n[cycle] Round ${loopRound}/${totalLoopRounds} started (${executionMode})`);
 
@@ -10388,66 +10532,6 @@ async function runDailyCycle(context) {
       });
     }
 
-    if ((sendMode === "internal" || sendMode === "hybrid") && pendingEntries.length > 1) {
-      const txCounts = sortedAccounts.map((account) => getPerAccountTxStats(account.name).ok);
-      const minTx = Math.min(...txCounts);
-      const maxAllowedTx = minTx + 1;
-
-      const eligible = [];
-      const sittingOut = [];
-      for (const entry of pendingEntries) {
-        const accountTx = getPerAccountTxStats(entry.account.name).ok;
-        if (accountTx <= maxAllowedTx) {
-          eligible.push(entry);
-        } else {
-          sittingOut.push(entry.account.name);
-        }
-      }
-
-      if (sittingOut.length > 0 && eligible.length > 0) {
-        console.log(
-          `[balance] TX balancing: min=${minTx} max-allowed=${maxAllowedTx} | ` +
-          `${eligible.length} eligible, ${sittingOut.length} sitting out: ${sittingOut.join(", ")}`
-        );
-        pendingEntries = eligible;
-      }
-    }
-
-    const allAccountNames = sortedAccounts.map((account) => account.name);
-    const allTxCounts = sortedAccounts.map((account) => ({
-      name: account.name,
-      tx: getPerAccountTxStats(account.name).ok
-    }));
-    const globalMinTx = allTxCounts.length > 0 ? Math.min(...allTxCounts.map((entry) => entry.tx)) : 0;
-    const lowTxAccountNames = allTxCounts
-      .filter((entry) => entry.tx <= globalMinTx + 1)
-      .map((entry) => entry.name);
-    logBalanceDistribution(allAccountNames, `Round ${loopRound}/${totalLoopRounds}`, accountSnapshots);
-    const balanceDist = computeBalanceDistribution(allAccountNames, accountSnapshots);
-    const lowCcAccountNames = balanceDist.deficit.map((entry) => entry.name);
-    const lowBalanceAccountNames = Array.from(new Set([...lowCcAccountNames, ...lowTxAccountNames]));
-    const roundSendPlan =
-      sendMode === "internal" || sendMode === "hybrid"
-        ? computeRoundSendPlan(sortedAccounts, accountSnapshots)
-        : new Map();
-
-    if (
-      (sendMode === "internal" || sendMode === "hybrid") &&
-      lowBalanceAccountNames.length > 0 &&
-      lowBalanceAccountNames.length < sortedAccounts.length
-    ) {
-      const txPart = lowTxAccountNames.length > 0
-        ? `tx-lagging(tx<=${globalMinTx + 1}): ${lowTxAccountNames.join(", ")}`
-        : "";
-      const ccPart = lowCcAccountNames.length > 0
-        ? `cc-deficit: ${lowCcAccountNames.join(", ")}`
-        : "";
-      const parts = [txPart, ccPart].filter(Boolean).join(" | ");
-      if (parts) {
-        console.log(`[prefer] Prioritizing sends to: ${parts}`);
-      }
-    }
-
     const hybridRoundAssignments =
       sendMode === "hybrid"
         ? buildHybridRoundAssignments(pendingEntries.map((entry) => entry.account))
@@ -10461,6 +10545,16 @@ async function runDailyCycle(context) {
         `${internalNames.length} internal [${internalNames.join(", ")}]`
       );
     }
+
+    const activeRoundAccounts = pendingEntries.map((entry) => entry.account);
+    const activeAccountNames = activeRoundAccounts.map((account) => account.name);
+    if (sendMode === "internal" || sendMode === "hybrid") {
+      logBalanceDistribution(activeAccountNames, `Round ${loopRound}/${totalLoopRounds}`, accountSnapshots);
+    }
+    const roundSendPlan =
+      sendMode === "internal" || sendMode === "hybrid"
+        ? computeRoundSendPlan(activeRoundAccounts, accountSnapshots, config.send, config)
+        : new Map();
 
     if (pendingEntries.length === 0) {
       console.log(
@@ -10491,11 +10585,18 @@ async function runDailyCycle(context) {
           Number.MAX_SAFE_INTEGER
         );
         const waitMs = Math.max(0, nearestReadyMs - nowMs);
-        const waitSeconds = Math.min(
-          maxDeferredWaitSeconds,
-          Math.max(1, Math.ceil(waitMs / 1000))
-        );
+        const waitCeilingSec = Math.max(1, Math.min(
+          Math.max(1, maxAccountDelaySec || roundDeferPollSeconds),
+          maxDeferredWaitSeconds
+        ));
+        const waitSeconds = Math.max(1, Math.min(waitCeilingSec, Math.ceil(waitMs / 1000)));
         const waitingNames = delayedEntries.map((entry) => entry.account.name).join(", ");
+        const cappedReadyMs = nowMs + (waitSeconds * 1000);
+        for (const entry of delayedEntries) {
+          if (entry.deferUntilMs > cappedReadyMs) {
+            entry.deferUntilMs = cappedReadyMs;
+          }
+        }
         console.log(
           `[cycle] Round ${loopRound}/${totalLoopRounds} waiting ${waitSeconds}s for deferred accounts: ${waitingNames}`
         );
@@ -10514,12 +10615,17 @@ async function runDailyCycle(context) {
       }
 
       const executionEntries = readyEntries;
+      const flowLabel = effectiveWorkerCount > 1 ? `workers=${effectiveWorkerCount}` : "sequential";
 
       let roundResults = [];
       const runOneEntry = async (entry, indexInRound) => {
         const account = entry.account;
+        const senderPlan = isObject(roundSendPlan.get(entry.account.name))
+          ? roundSendPlan.get(entry.account.name)
+          : {};
         const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
         tokens.accounts[account.name] = accountToken;
+        console.log(`[${flowLabel}] [${indexInRound + 1}/${executionEntries.length}] Processing ${account.name}...`);
 
         try {
           const result = await processAccount({
@@ -10549,9 +10655,10 @@ async function runDailyCycle(context) {
               ? entry.smartFillBlockRecipients
               : [],
             resumeFromDeferReason: entry.deferReason || "",
-            preferredInternalRecipients:
-              roundSendPlan.get(entry.account.name) || lowBalanceAccountNames,
-            plannedInternalAmount: null
+            preferredInternalRecipients: Array.isArray(senderPlan.preferredRecipients)
+              ? senderPlan.preferredRecipients
+              : [],
+            plannedInternalAmount: senderPlan.plannedAmount || null
           });
           return { entry, result, error: null };
         } catch (error) {
@@ -10585,54 +10692,29 @@ async function runDailyCycle(context) {
         }
       };
 
-      if (isSequentialRound || workerCount <= 1) {
-        const sequentialAccounts = executionEntries.map((item) => item.account.name).join(" -> ");
-        console.log(
-          `[sequential] Processing ${executionEntries.length} accounts one by one: ${sequentialAccounts}`
+      const batches = [];
+      for (let startIndex = 0; startIndex < executionEntries.length; startIndex += effectiveWorkerCount) {
+        batches.push(executionEntries.slice(startIndex, startIndex + effectiveWorkerCount));
+      }
+
+      const readyOrderLabel = executionEntries.map((item) => item.account.name).join(" -> ");
+      console.log(
+        `[${flowLabel}] Processing ${executionEntries.length} accounts in ${batches.length} batch(es): ${readyOrderLabel}`
+      );
+
+      let processedCount = 0;
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+        const batch = batches[batchIndex];
+        const batchResults = await Promise.all(
+          batch.map((entry, indexInBatch) => runOneEntry(entry, processedCount + indexInBatch))
         );
+        roundResults.push(...batchResults);
+        processedCount += batch.length;
 
-        for (let index = 0; index < executionEntries.length; index += 1) {
-          const entry = executionEntries[index];
-          console.log(
-            `[sequential] [${index + 1}/${executionEntries.length}] Processing ${entry.account.name}...`
-          );
-          roundResults.push(await runOneEntry(entry, index));
-
-          if (index < executionEntries.length - 1 && !args.dryRun && accountDelayMaxSec > 0) {
-            const seqDelaySec = randomIntInclusive(accountDelayMinSec, accountDelayMaxSec);
-            console.log(`[sequential] Waiting ${seqDelaySec}s before next account...`);
-            await sleep(seqDelaySec * 1000);
-          }
-        }
-      } else {
-        const batches = [];
-        for (let startIndex = 0; startIndex < executionEntries.length; startIndex += workerCount) {
-          batches.push(executionEntries.slice(startIndex, startIndex + workerCount));
-        }
-
-        const readyOrderLabel = executionEntries.map((item) => item.account.name).join(" -> ");
-        console.log(
-          `[workers] Processing ${executionEntries.length} accounts in ${batches.length} batch(es) ` +
-          `(workers=${workerCount}): ${readyOrderLabel}`
-        );
-
-        let processedCount = 0;
-        for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-          const batch = batches[batchIndex];
-          const batchNames = batch.map((item) => item.account.name).join(", ");
-          console.log(`[workers] Batch ${batchIndex + 1}/${batches.length}: ${batchNames}`);
-
-          const batchResults = await Promise.all(
-            batch.map((entry, indexInBatch) => runOneEntry(entry, processedCount + indexInBatch))
-          );
-          roundResults.push(...batchResults);
-          processedCount += batch.length;
-
-          if (batchIndex < batches.length - 1 && !args.dryRun && accountDelayMaxSec > 0) {
-            const batchDelaySec = randomIntInclusive(accountDelayMinSec, accountDelayMaxSec);
-            console.log(`[workers] Waiting ${batchDelaySec}s before next batch...`);
-            await sleep(batchDelaySec * 1000);
-          }
+        if (batchIndex < batches.length - 1 && !args.dryRun && accountDelayMaxSec > 0) {
+          const batchDelaySec = humanLikeDelay(accountDelayMinSec, accountDelayMaxSec);
+          console.log(`[${flowLabel}] Waiting ${batchDelaySec}s before next batch...`);
+          await sleep(batchDelaySec * 1000);
         }
       }
 
