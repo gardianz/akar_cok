@@ -71,6 +71,15 @@
     "minScoreThreshold": 50,
     "minHoldBalanceCc": 10
   },
+  "captcha": {
+    "enabled": false,
+    "provider": "2captcha",
+    "apiKey": "",
+    "turnstileSitekey": "0x4AAAAAAC-oOGMu5lxFvc7w",
+    "pageUrl": "https://bridge.rootsfi.com/send",
+    "solveTimeoutSeconds": 180,
+    "pollIntervalSeconds": 5
+  },
   "telegram": {
     "enabled": false,
     "botToken": "YOUR_TELEGRAM_BOT_TOKEN",

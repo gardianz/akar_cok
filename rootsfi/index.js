@@ -1327,6 +1327,15 @@ const INTERNAL_API_DEFAULTS = {
     maxOtpRefreshAttempts: 3,
     fallbackToOtpOnPersistentCheckpoint: true
   },
+  captcha: {
+    enabled: false,
+    provider: "2captcha",
+    apiKey: "",
+    turnstileSitekey: "0x4AAAAAAC-oOGMu5lxFvc7w",
+    pageUrl: "https://bridge.rootsfi.com/send",
+    solveTimeoutSeconds: 180,
+    pollIntervalSeconds: 5
+  },
   send: {
     maxTransfersPerHour: 1,
     minDelayTxSeconds: 120,
@@ -3483,6 +3492,7 @@ function cloneRuntimeConfig(config) {
     http: { ...config.http },
     requestPacing: { ...config.requestPacing },
     session: sessionConfig,
+    captcha: isObject(config && config.captcha) ? { ...config.captcha } : { ...INTERNAL_API_DEFAULTS.captcha },
     send: {
       ...config.send,
       tierAmounts: {
@@ -3573,9 +3583,10 @@ async function promptSendMode() {
     console.log("2. Internal Address (ke address masing-masing akun)");
     console.log("3. Balance Only (cek saldo saja)");
     console.log("4. Hybrid Strategy (kadang internal, kadang external)");
+    console.log("5. OTP Session Seeding (request OTP tiap akun & simpan sesi)");
     console.log("");
 
-    const answer = await rl.question("Pilih mode [1/2/3/4]: ");
+    const answer = await rl.question("Pilih mode [1/2/3/4/5]: ");
     const choice = answer.trim();
 
     if (choice === "1") {
@@ -3586,6 +3597,8 @@ async function promptSendMode() {
       return "balance-only";
     } else if (choice === "4") {
       return "hybrid";
+    } else if (choice === "5") {
+      return "otp";
     } else {
       console.log("[warn] Pilihan tidak valid, default ke balance-only");
       return "balance-only";
@@ -5152,6 +5165,80 @@ function isSendEligibilityDelayError(error) {
   );
 }
 
+function isTrafficCongestionError(error) {
+  const status = Number(error && error.status);
+  const message = String(error && error.message ? error.message : error || "").toLowerCase();
+  return (
+    status === 409 ||
+    message.includes("network congested") ||
+    message.includes("traffic warning") ||
+    message.includes("trafficchallenge") ||
+    message.includes("acknowledgetrafficwarning")
+  );
+}
+
+async function solveTurnstileWith2Captcha(captchaConfig, logTag = null) {
+  if (!captchaConfig || !captchaConfig.enabled) {
+    throw new Error("Captcha solving disabled (config.captcha.enabled=false)");
+  }
+  if (String(captchaConfig.provider || "").trim().toLowerCase() !== "2captcha") {
+    throw new Error(`Unsupported captcha provider: ${captchaConfig.provider || "unknown"}`);
+  }
+  if (!captchaConfig.apiKey) {
+    throw new Error("Captcha apiKey kosong di config.captcha.apiKey");
+  }
+
+  const prefix = logTag ? `[captcha ${logTag}]` : "[captcha]";
+  const apiKey = captchaConfig.apiKey;
+  const sitekey = captchaConfig.turnstileSitekey;
+  const pageurl = captchaConfig.pageUrl;
+  const pollMs = Math.max(3000, captchaConfig.pollIntervalSeconds * 1000);
+  const deadline = Date.now() + (captchaConfig.solveTimeoutSeconds * 1000);
+
+  const submitUrl =
+    `https://2captcha.com/in.php?key=${encodeURIComponent(apiKey)}` +
+    `&method=turnstile&sitekey=${encodeURIComponent(sitekey)}` +
+    `&pageurl=${encodeURIComponent(pageurl)}&json=1`;
+
+  console.log(`${prefix} Submitting Turnstile task (sitekey=${sitekey})`);
+  const submitResponse = await fetch(submitUrl, { method: "GET" });
+  const submitPayload = await submitResponse.json().catch(() => ({}));
+  if (Number(submitPayload.status) !== 1 || !submitPayload.request) {
+    throw new Error(
+      `2Captcha submit failed: ${submitPayload && submitPayload.request ? submitPayload.request : "unknown error"}`
+    );
+  }
+  const taskId = String(submitPayload.request);
+  console.log(`${prefix} Task submitted, id=${taskId}. Polling every ${Math.round(pollMs / 1000)}s...`);
+
+  const resultUrl =
+    `https://2captcha.com/res.php?key=${encodeURIComponent(apiKey)}` +
+    `&action=get&id=${encodeURIComponent(taskId)}&json=1`;
+
+  await sleep(10000);
+
+  while (Date.now() < deadline) {
+    const pollResponse = await fetch(resultUrl, { method: "GET" });
+    const pollPayload = await pollResponse.json().catch(() => ({}));
+    const status = Number(pollPayload.status);
+    const request = String(pollPayload.request || "");
+
+    if (status === 1 && request && request !== "CAPCHA_NOT_READY") {
+      console.log(`${prefix} Solved (token length=${request.length})`);
+      return request;
+    }
+    if (request === "CAPCHA_NOT_READY") {
+      await sleep(pollMs);
+      continue;
+    }
+    throw new Error(`2Captcha poll failed: ${request || "unknown"}`);
+  }
+
+  throw new Error(
+    `2Captcha timeout setelah ${captchaConfig.solveTimeoutSeconds}s (task id=${taskId})`
+  );
+}
+
 function isBalanceContractFragmentationError(error) {
   const status = Number(error && error.status);
   const message = String(error && error.message ? error.message : error || "").toLowerCase();
@@ -5502,7 +5589,11 @@ function normalizeConfig(rawConfig) {
     clampToNonNegativeInt(
       Object.prototype.hasOwnProperty.call(sendInput, "maxTransfersPerHour")
         ? sendInput.maxTransfersPerHour
-        : INTERNAL_API_DEFAULTS.send.maxTransfersPerHour,
+        : (
+            Object.prototype.hasOwnProperty.call(sendInput, "hourlyMaxTx")
+              ? sendInput.hourlyMaxTx
+              : INTERNAL_API_DEFAULTS.send.maxTransfersPerHour
+          ),
       INTERNAL_API_DEFAULTS.send.maxTransfersPerHour
     )
   );
@@ -5663,6 +5754,25 @@ function normalizeConfig(rawConfig) {
     randomAmount
   };
 
+  const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
+  const captcha = {
+    enabled: captchaInput.enabled === true,
+    provider: String(captchaInput.provider || "2captcha").trim().toLowerCase() || "2captcha",
+    apiKey: String(captchaInput.apiKey || captchaInput.api_key || "").trim(),
+    turnstileSitekey: String(
+      captchaInput.turnstileSitekey || captchaInput.sitekey || INTERNAL_API_DEFAULTS.captcha.turnstileSitekey
+    ).trim(),
+    pageUrl: String(captchaInput.pageUrl || captchaInput.page_url || INTERNAL_API_DEFAULTS.captcha.pageUrl).trim(),
+    solveTimeoutSeconds: Math.max(
+      30,
+      clampToNonNegativeInt(captchaInput.solveTimeoutSeconds, INTERNAL_API_DEFAULTS.captcha.solveTimeoutSeconds)
+    ),
+    pollIntervalSeconds: Math.max(
+      3,
+      clampToNonNegativeInt(captchaInput.pollIntervalSeconds, INTERNAL_API_DEFAULTS.captcha.pollIntervalSeconds)
+    )
+  };
+
   const safetyInput = isObject(rawConfig.safety) ? rawConfig.safety : {};
   const safety = {
     minScoreThreshold: clampToNonNegativeInt(
@@ -5687,6 +5797,7 @@ function normalizeConfig(rawConfig) {
     requestPacing,
     recipientFile,
     session,
+    captcha,
     send,
     ui,
     telegram,
@@ -6599,7 +6710,7 @@ class RootsFiApiClient {
     });
   }
 
-  async sendCcTransfer(recipient, amount, idempotencyKey) {
+  async sendCcTransfer(recipient, amount, idempotencyKey, extraBody = null) {
     return this.requestJson("POST", this.paths.sendTransfer, {
       refererPath: this.paths.send,
       timeoutMs: 60000,
@@ -6612,12 +6723,13 @@ class RootsFiApiClient {
         idempotencyKey,
         preferredNetwork: "canton",
         tokenType: "CC",
-        instrumentId: "Amulet"
+        instrumentId: "Amulet",
+        ...(isObject(extraBody) ? extraBody : {})
       }
     });
   }
 
-  async sendCcTransferByUsername(username, amount, idempotencyKey) {
+  async sendCcTransferByUsername(username, amount, idempotencyKey, extraBody = null) {
     return this.requestJson("POST", this.paths.sendTransfer, {
       refererPath: this.paths.send,
       timeoutMs: 60000,
@@ -6629,7 +6741,8 @@ class RootsFiApiClient {
         idempotencyKey,
         preferredNetwork: "canton",
         tokenType: "CC",
-        instrumentId: "Amulet"
+        instrumentId: "Amulet",
+        ...(isObject(extraBody) ? extraBody : {})
       }
     });
   }
@@ -7131,33 +7244,81 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   stepLog(`[step] Transfer CC (idempotencyKey=${idempotencyKey})`);
 
   let transferResponse = null;
+  let congestionAttempt = 0;
+  const maxCongestionRetries = 2;
+  let trafficExtras = null;
   try {
-    transferResponse = await apiCallWithRetry(
-      () => (
-        resolvedUsername
-          ? client.sendCcTransferByUsername(resolvedUsername, sendRequest.amount, idempotencyKey)
-          : client.sendCcTransfer(sendRequest.address, sendRequest.amount, idempotencyKey)
-      ),
-      "Transfer CC",
-      API_CALL_MAX_RETRIES,
-      75000,
-      {
-        // Timeout transfer should restart account immediately without timeout backoff delay.
-        maxConsecutiveTimeouts: 1
+    while (true) {
+      try {
+        transferResponse = await apiCallWithRetry(
+          () => (
+            resolvedUsername
+              ? client.sendCcTransferByUsername(
+                  resolvedUsername,
+                  sendRequest.amount,
+                  idempotencyKey,
+                  trafficExtras
+                )
+              : client.sendCcTransfer(
+                  sendRequest.address,
+                  sendRequest.amount,
+                  idempotencyKey,
+                  trafficExtras
+                )
+          ),
+          "Transfer CC",
+          API_CALL_MAX_RETRIES,
+          75000,
+          {
+            maxConsecutiveTimeouts: 1
+          }
+        );
+        break;
+      } catch (error) {
+        if (error && error.isSoftRestart) {
+          throw error;
+        }
+
+        if (isTimeoutError(error)) {
+          throw new SoftRestartError(
+            `Transfer CC timeout for ${sendRequest.label}. Triggering immediate account restart.`,
+            1
+          );
+        }
+
+        if (isTrafficCongestionError(error) && congestionAttempt < maxCongestionRetries) {
+          congestionAttempt += 1;
+          const captchaConfig = config && config.captcha;
+          if (!captchaConfig || !captchaConfig.enabled || !captchaConfig.apiKey) {
+            console.log(
+              "[warn] Transfer 409/red status diterima, tapi captcha tidak dikonfigurasi. " +
+              "Set config.captcha.enabled=true + apiKey untuk bypass otomatis."
+            );
+            throw error;
+          }
+          stepLog(
+            `[warn] Transfer 409/red status, attempt ${congestionAttempt}/${maxCongestionRetries}. ` +
+            `Solving Turnstile via 2Captcha...`
+          );
+          let turnstileToken;
+          try {
+            turnstileToken = await solveTurnstileWith2Captcha(captchaConfig, accountLogTag);
+          } catch (solveError) {
+            console.log(`[warn] Captcha solve gagal: ${solveError.message}`);
+            throw error;
+          }
+          trafficExtras = {
+            acknowledgeTrafficWarning: true,
+            trafficChallengeToken: turnstileToken
+          };
+          stepLog("[step] Retry transfer dengan acknowledgeTrafficWarning=true + trafficChallengeToken");
+          continue;
+        }
+
+        throw error;
       }
-    );
+    }
   } catch (error) {
-    if (error && error.isSoftRestart) {
-      throw error;
-    }
-
-    if (isTimeoutError(error)) {
-      throw new SoftRestartError(
-        `Transfer CC timeout for ${sendRequest.label}. Triggering immediate account restart.`,
-        1
-      );
-    }
-
     throw error;
   }
 
@@ -10727,29 +10888,69 @@ async function runDailyCycle(context) {
         }
       };
 
-      const batches = [];
-      for (let startIndex = 0; startIndex < executionEntries.length; startIndex += effectiveWorkerCount) {
-        batches.push(executionEntries.slice(startIndex, startIndex + effectiveWorkerCount));
+      const readyOrderLabel = executionEntries.map((item) => item.account.name).join(" -> ");
+      if (chainDependencyMode) {
+        console.log(
+          `[${flowLabel}] Processing ${executionEntries.length} accounts in chain order: ${readyOrderLabel}`
+        );
+      } else {
+        const batches = [];
+        for (let startIndex = 0; startIndex < executionEntries.length; startIndex += effectiveWorkerCount) {
+          batches.push(executionEntries.slice(startIndex, startIndex + effectiveWorkerCount));
+        }
+        console.log(
+          `[${flowLabel}] Processing ${executionEntries.length} accounts in ${batches.length} batch(es): ${readyOrderLabel}`
+        );
+
+        let processedCount = 0;
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+          const batch = batches[batchIndex];
+          const batchResults = await Promise.all(
+            batch.map((entry, indexInBatch) => runOneEntry(entry, processedCount + indexInBatch))
+          );
+          roundResults.push(...batchResults);
+          processedCount += batch.length;
+
+          if (batchIndex < batches.length - 1 && !args.dryRun && accountDelayMaxSec > 0 && !chainDependencyMode) {
+            const batchDelaySec = humanLikeDelay(accountDelayMinSec, accountDelayMaxSec);
+            console.log(`[${flowLabel}] Waiting ${batchDelaySec}s before next batch...`);
+            await sleep(batchDelaySec * 1000);
+          }
+        }
       }
 
-      const readyOrderLabel = executionEntries.map((item) => item.account.name).join(" -> ");
-      console.log(
-        `[${flowLabel}] Processing ${executionEntries.length} accounts in ${batches.length} batch(es): ${readyOrderLabel}`
-      );
+      if (chainDependencyMode) {
+        const remainingEntries = executionEntries.slice();
+        let processedCount = 0;
+        let nextSenderName = String(remainingEntries[0] && remainingEntries[0].account && remainingEntries[0].account.name
+          ? remainingEntries[0].account.name
+          : "");
 
-      let processedCount = 0;
-      for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-        const batch = batches[batchIndex];
-        const batchResults = await Promise.all(
-          batch.map((entry, indexInBatch) => runOneEntry(entry, processedCount + indexInBatch))
-        );
-        roundResults.push(...batchResults);
-        processedCount += batch.length;
+        while (remainingEntries.length > 0) {
+          let nextIndex = remainingEntries.findIndex((entry) => String(entry.account && entry.account.name ? entry.account.name : "") === nextSenderName);
+          if (nextIndex === -1) {
+            nextIndex = 0;
+          }
 
-        if (batchIndex < batches.length - 1 && !args.dryRun && accountDelayMaxSec > 0 && !chainDependencyMode) {
-          const batchDelaySec = humanLikeDelay(accountDelayMinSec, accountDelayMaxSec);
-          console.log(`[${flowLabel}] Waiting ${batchDelaySec}s before next batch...`);
-          await sleep(batchDelaySec * 1000);
+          const [entry] = remainingEntries.splice(nextIndex, 1);
+          const batchResult = await runOneEntry(entry, processedCount);
+          roundResults.push(batchResult);
+          processedCount += 1;
+
+          const sentRecipientLabels = Array.isArray(batchResult && batchResult.result && batchResult.result.sentRecipientLabels)
+            ? batchResult.result.sentRecipientLabels
+            : [];
+          const actualRecipient = String(sentRecipientLabels[0] || "").trim();
+          const recipientStillPending = remainingEntries.some((candidate) => {
+            return String(candidate.account && candidate.account.name ? candidate.account.name : "") === actualRecipient;
+          });
+          if (actualRecipient) {
+            console.log(
+              `[internal-chain] Handoff ${entry.account.name} -> ${actualRecipient}` +
+              `${recipientStillPending ? " (next sender locked)" : " (recipient already done/skipped)"}`
+            );
+          }
+          nextSenderName = recipientStillPending ? actualRecipient : "";
         }
       }
 
@@ -10933,6 +11134,138 @@ async function runDailyCycle(context) {
   return { results, successful, failed, cycleDuration };
 }
 
+async function runOtpOnlyFlow(context) {
+  const { config, accounts, tokens, tokensPath } = context;
+  const accountList = Array.isArray(accounts && accounts.accounts) ? accounts.accounts : [];
+  console.log(`\n${"=".repeat(70)}`);
+  console.log(`[otp-mode] Request OTP untuk ${accountList.length} akun, hasil tersimpan ke tokens.json`);
+  console.log(`${"=".repeat(70)}\n`);
+
+  const summary = { ok: [], failed: [] };
+
+  for (let i = 0; i < accountList.length; i += 1) {
+    const account = accountList[i];
+    const tag = `[${i + 1}/${accountList.length}] ${account.name}`;
+    const selectedEmail = String(account.email || "").trim();
+
+    console.log(`\n${"-".repeat(70)}`);
+    console.log(`${tag} | ${maskEmail(selectedEmail)}`);
+    console.log(`${"-".repeat(70)}`);
+
+    if (!selectedEmail || !selectedEmail.includes("@")) {
+      console.log(`[error] ${tag}: email invalid, skip`);
+      summary.failed.push({ name: account.name, reason: "invalid-email" });
+      continue;
+    }
+
+    const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
+    tokens.accounts[account.name] = accountToken;
+
+    const accountConfig = cloneRuntimeConfig(config);
+    applyTokenProfileToConfig(accountConfig, accountToken);
+
+    let checkpointRefreshCount = 0;
+    let lastVercelRefreshAt = String(accountToken.security.lastVercelRefreshAt || "").trim();
+    const markCheckpointRefresh = () => {
+      checkpointRefreshCount += 1;
+      lastVercelRefreshAt = new Date().toISOString();
+    };
+
+    const client = new RootsFiApiClient(accountConfig);
+
+    try {
+      console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
+      await refreshVercelSecurityCookies(
+        client,
+        accountConfig,
+        `OTP-mode fresh browser challenge (${account.name})`,
+        markCheckpointRefresh
+      );
+
+      console.log(`[step] ${tag}: Send OTP ke ${maskEmail(selectedEmail)}`);
+      const sendOtpResponse = await sendOtpWithCheckpointRecovery(
+        client,
+        selectedEmail,
+        accountConfig,
+        markCheckpointRefresh
+      );
+      const otpId = sendOtpResponse && sendOtpResponse.data ? sendOtpResponse.data.otpId : null;
+      if (!otpId) {
+        throw new Error("send-otp tidak return otpId");
+      }
+      console.log(`[info] ${tag}: OTP terkirim | otpId=${maskSecret(otpId, 8, 6)}`);
+
+      const otpCode = await promptOtpCode();
+      if (!/^\d{4,8}$/.test(otpCode)) {
+        throw new Error("OTP harus 4-8 digit angka");
+      }
+
+      console.log(`[step] ${tag}: Verify OTP`);
+      const verifyResponse = await client.verifyOtp({
+        email: selectedEmail,
+        otpId,
+        otpCode
+      });
+      const nextStep = verifyResponse && verifyResponse.data ? verifyResponse.data.nextStep : null;
+      console.log(`[info] ${tag}: verify-otp nextStep=${nextStep || "unknown"}`);
+
+      console.log(`[step] ${tag}: Sync onboard`);
+      await client.syncAccount(accountConfig.paths.onboard);
+
+      const pendingResp = await client.getPending(accountConfig.paths.onboard);
+      const pendingData = pendingResp && pendingResp.data ? pendingResp.data : {};
+      if (pendingData.pending) {
+        if (pendingData.alreadyActive === true) {
+          console.log(`[step] ${tag}: Finalize returning account`);
+          await client.finalizeReturning();
+        } else {
+          console.log(`[warn] ${tag}: Akun masih pending & belum alreadyActive (skip finalize)`);
+        }
+      }
+
+      console.log(`[step] ${tag}: Sync bridge`);
+      await client.syncAccount(accountConfig.paths.bridge);
+
+      tokens.accounts[account.name] = applyClientStateToTokenProfile(
+        accountToken,
+        client,
+        checkpointRefreshCount,
+        lastVercelRefreshAt
+      );
+      await saveTokensSerial(tokensPath, tokens);
+      console.log(`[done] ${tag}: Sesi tersimpan ke tokens.json`);
+      summary.ok.push(account.name);
+    } catch (error) {
+      const msg = error && error.message ? error.message : String(error);
+      console.log(`[error] ${tag}: ${msg}`);
+      summary.failed.push({ name: account.name, reason: msg });
+      try {
+        tokens.accounts[account.name] = applyClientStateToTokenProfile(
+          accountToken,
+          client,
+          checkpointRefreshCount,
+          lastVercelRefreshAt
+        );
+        await saveTokensSerial(tokensPath, tokens);
+      } catch (persistError) {
+        console.log(`[warn] ${tag}: gagal simpan token profile setelah error: ${persistError.message}`);
+      }
+    }
+  }
+
+  console.log(`\n${"=".repeat(70)}`);
+  console.log(`[otp-mode] Done | ok=${summary.ok.length} failed=${summary.failed.length}`);
+  if (summary.ok.length > 0) {
+    console.log(`[otp-mode] Success: ${summary.ok.join(", ")}`);
+  }
+  if (summary.failed.length > 0) {
+    console.log(
+      `[otp-mode] Failed: ${summary.failed.map((item) => `${item.name}(${item.reason})`).join(", ")}`
+    );
+  }
+  console.log(`${"=".repeat(70)}\n`);
+}
+
 async function run() {
   if (typeof fetch !== "function") {
     throw new Error("Global fetch is not available. Use Node.js 18+.");
@@ -11027,6 +11360,19 @@ async function run() {
   // Prompt for send mode
   const sendMode = await promptSendMode();
   console.log(`\n[init] Selected mode: ${sendMode}`);
+
+  if (sendMode === "otp") {
+    const otpSelection = await promptAccountSelection(accounts.accounts);
+    const otpAccounts = otpSelection.selectedAccounts;
+    console.log(`\n[init] OTP mode - akun terpilih: ${otpAccounts.length}`);
+    await runOtpOnlyFlow({
+      config,
+      accounts: { ...accounts, accounts: otpAccounts },
+      tokens,
+      tokensPath
+    });
+    return;
+  }
 
   if (
     (sendMode === "external" || sendMode === "hybrid") &&
