@@ -6,6 +6,7 @@
     "parallelJitterMinSeconds": 1,
     "parallelJitterMaxSeconds": 10,
     "delayCycleSeconds": 1800,
+    "hourlyCapPollSeconds": 60,
     "sequentialAllRounds": false,
     "workers": 2,
     "maxDeferredWaitSeconds": 45,
