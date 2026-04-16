@@ -804,7 +804,7 @@ function buildInternalSendRequests(
       amount,
       label: recipient.name,
       address: recipient.address,
-      source: "internal-rotating",
+      source: "internal-chain",
       offset,
       internalRecipientCandidate: true
     });
@@ -9125,11 +9125,6 @@ async function processAccount(context) {
     preferredInternalRecipients,
     plannedInternalAmount
   } = context;
-  const safeSmartFillBlockRecipients = Array.isArray(smartFillBlockRecipients)
-    ? smartFillBlockRecipients
-        .map((item) => String(item || "").trim())
-        .filter((item) => Boolean(item))
-    : [];
   const safeResumeFromDeferReason = String(resumeFromDeferReason || "").trim();
 
   const selectedEmail = String(process.env.ROOTSFI_EMAIL || account.email).trim();
@@ -9308,6 +9303,13 @@ async function processAccount(context) {
       }
 
       if (sendMode === "hybrid") {
+        const internalRoutingAccounts =
+          Array.isArray(preferredInternalRecipients) && preferredInternalRecipients.length > 0
+            ? selectedAccounts.filter((entry) => {
+                const name = String(entry && entry.name ? entry.name : "").trim();
+                return name === account.name || preferredInternalRecipients.includes(name);
+              })
+            : selectedAccounts;
         if (recipientsInfo.missing || recipientsInfo.recipients.length === 0) {
           throw new Error("Hybrid mode requires recipient.txt with valid recipients");
         }
@@ -9317,22 +9319,16 @@ async function processAccount(context) {
         }
 
         const hybridPlan = buildHybridSendRequests(
-          selectedAccounts,
+          internalRoutingAccounts,
           account.name,
           recipientsInfo.recipients,
           sendPolicy,
           currentRound,
-          safeSmartFillBlockRecipients,
+          [],
           hybridAssignedMode,
           Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
           plannedInternalAmount || null
         );
-
-        if (hybridPlan.selectedMode === "internal" && safeSmartFillBlockRecipients.length > 0) {
-          console.log(
-            `[hybrid] Smart-fill guard for ${account.name}: avoid send-back to [${safeSmartFillBlockRecipients.join(", ")}]`
-          );
-        }
 
         if (!hybridPlan || hybridPlan.requests.length === 0) {
           const retryAfterSeconds = Math.max(
@@ -9407,21 +9403,22 @@ async function processAccount(context) {
           throw new Error("Internal mode requires config.send.randomAmount.enabled=true");
         }
 
+        const internalRoutingAccounts =
+          Array.isArray(preferredInternalRecipients) && preferredInternalRecipients.length > 0
+            ? selectedAccounts.filter((entry) => {
+                const name = String(entry && entry.name ? entry.name : "").trim();
+                return name === account.name || preferredInternalRecipients.includes(name);
+              })
+            : selectedAccounts;
         const internalPlan = buildInternalSendRequests(
-          selectedAccounts,
+          internalRoutingAccounts,
           account.name,
           sendPolicy,
           currentRound,
-          safeSmartFillBlockRecipients,
+          [],
           Array.isArray(preferredInternalRecipients) ? preferredInternalRecipients : [],
           plannedInternalAmount || null
         );
-
-        if (safeSmartFillBlockRecipients.length > 0) {
-          console.log(
-            `[internal] Smart-fill guard for ${account.name}: avoid send-back to [${safeSmartFillBlockRecipients.join(", ")}]`
-          );
-        }
 
         if (!internalPlan || internalPlan.requests.length === 0) {
           const retryAfterSeconds = Math.max(
@@ -10446,8 +10443,6 @@ async function runDailyCycle(context) {
   const accountSnapshots = isObject(persistedAccountSnapshots) ? persistedAccountSnapshots : {};
   context.accountSnapshots = accountSnapshots;
   const roundDeferPollSeconds = TX_RETRY_INITIAL_DELAY_SECONDS;
-  const SMART_FILL_RETRY_DELAY_SECONDS = 20;
-  const SMART_FILL_MAX_ATTEMPTS_PER_ROUND = 2;
   const CARRY_OVER_ROUND_DEFER_DEFAULT_SECONDS = 45;
   const carryOverDeferStateByAccount = new Map();
 
@@ -10525,10 +10520,7 @@ async function runDailyCycle(context) {
         account,
         deferUntilMs: 0,
         deferReason: "",
-        debtTurns: 0,
-        smartFillAttempts: 0,
-        smartFillBlockRecipients: [],
-        smartFillPriority: 0
+        debtTurns: 0
       });
     }
 
@@ -10616,6 +10608,20 @@ async function runDailyCycle(context) {
 
       const executionEntries = readyEntries;
       const flowLabel = effectiveWorkerCount > 1 ? `workers=${effectiveWorkerCount}` : "sequential";
+      const roundPlanOrder = Array.from(roundSendPlan.keys());
+      const roundPlanOrderMap = new Map(roundPlanOrder.map((name, index) => [name, index]));
+      executionEntries.sort((left, right) => {
+        const leftRank = roundPlanOrderMap.has(left.account.name)
+          ? roundPlanOrderMap.get(left.account.name)
+          : Number.MAX_SAFE_INTEGER;
+        const rightRank = roundPlanOrderMap.has(right.account.name)
+          ? roundPlanOrderMap.get(right.account.name)
+          : Number.MAX_SAFE_INTEGER;
+        if (leftRank !== rightRank) {
+          return leftRank - rightRank;
+        }
+        return String(left.account.name || "").localeCompare(String(right.account.name || ""));
+      });
 
       let roundResults = [];
       const runOneEntry = async (entry, indexInRound) => {
@@ -10639,7 +10645,7 @@ async function runDailyCycle(context) {
             args,
             accountIndex: indexInRound,
             totalAccounts,
-            selectedAccounts: sortedAccounts,
+            selectedAccounts: activeRoundAccounts,
             accountSnapshots,
             telegramReporter,
             walleyRefundBridge,
@@ -10651,9 +10657,7 @@ async function runDailyCycle(context) {
                 : (sendMode === "hybrid" ? "internal" : null),
             deferWalleyRefundsToRoundLevel: true,
             maxLoopTxOverride: sendMode === "balance-only" ? null : 1,
-            smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
-              ? entry.smartFillBlockRecipients
-              : [],
+            smartFillBlockRecipients: [],
             resumeFromDeferReason: entry.deferReason || "",
             preferredInternalRecipients: Array.isArray(senderPlan.preferredRecipients)
               ? senderPlan.preferredRecipients
@@ -10737,25 +10741,6 @@ async function runDailyCycle(context) {
       // Process results
       let passMadeProgress = false;
       const nextPendingEntries = delayedEntries.slice();
-      const inboundSendersByRecipient = new Map();
-
-      for (const { entry, result, error } of roundResults) {
-        if (error || !result || !Array.isArray(result.sentRecipientLabels)) {
-          continue;
-        }
-
-        for (const recipientLabelRaw of result.sentRecipientLabels) {
-          const recipientLabel = String(recipientLabelRaw || "").trim();
-          if (!recipientLabel) {
-            continue;
-          }
-
-          if (!inboundSendersByRecipient.has(recipientLabel)) {
-            inboundSendersByRecipient.set(recipientLabel, []);
-          }
-          inboundSendersByRecipient.get(recipientLabel).push(entry.account.name);
-        }
-      }
       
       for (const { entry, result, error } of roundResults) {
         if (error) {
@@ -10768,8 +10753,6 @@ async function runDailyCycle(context) {
         if (result && result.deferred && sendMode !== "balance-only") {
           const deferReason = String(result.deferReason || "temporary");
 
-          // Insufficient balance should not block the current parallel round.
-          // Let other accounts continue, then retry this account in the next round.
           if (
             deferReason === "insufficient-balance" ||
             deferReason === "fragmented-balance" ||
@@ -10784,37 +10767,6 @@ async function runDailyCycle(context) {
             const availableLabel = Number.isFinite(Number(result.deferAvailableAmount))
               ? `have=${result.deferAvailableAmount}`
               : "have=n/a";
-            const inboundSenders = inboundSendersByRecipient.get(entry.account.name) || [];
-            const smartFillAttempts = Math.max(
-              0,
-              clampToNonNegativeInt(entry.smartFillAttempts, 0)
-            );
-
-            if (
-              (sendMode === "internal" || sendMode === "hybrid") &&
-              inboundSenders.length > 0 &&
-              smartFillAttempts < SMART_FILL_MAX_ATTEMPTS_PER_ROUND
-            ) {
-              const retryAfterSeconds = SMART_FILL_RETRY_DELAY_SECONDS;
-              const inboundSendersLabel = inboundSenders.join(", ");
-              console.log(
-                `[cycle] Smart-fill ${entry.account.name}: inbound from [${inboundSendersLabel}] detected. ` +
-                `Retry in ${retryAfterSeconds}s (attempt ${smartFillAttempts + 1}/${SMART_FILL_MAX_ATTEMPTS_PER_ROUND})`
-              );
-
-              nextPendingEntries.push({
-                account: entry.account,
-                deferUntilMs: Date.now() + (retryAfterSeconds * 1000),
-                deferReason: "smart-fill",
-                debtTurns: (entry.debtTurns || 0) + 1,
-                smartFillAttempts: smartFillAttempts + 1,
-                smartFillBlockRecipients: inboundSenders.slice(),
-                smartFillPriority: 2
-              });
-              passMadeProgress = true;
-              continue;
-            }
-
             const carryOverRetryAfterSeconds = Math.max(
               30,
               clampToNonNegativeInt(
@@ -10852,12 +10804,7 @@ async function runDailyCycle(context) {
             account: entry.account,
             deferUntilMs,
             deferReason,
-            debtTurns: (entry.debtTurns || 0) + 1,
-            smartFillAttempts: clampToNonNegativeInt(entry.smartFillAttempts, 0),
-            smartFillBlockRecipients: Array.isArray(entry.smartFillBlockRecipients)
-              ? entry.smartFillBlockRecipients
-              : [],
-            smartFillPriority: clampToNonNegativeInt(entry.smartFillPriority, 0)
+            debtTurns: (entry.debtTurns || 0) + 1
           });
           carryOverDeferStateByAccount.set(entry.account.name, {
             untilMs: deferUntilMs,
@@ -10877,13 +10824,6 @@ async function runDailyCycle(context) {
       }
 
       nextPendingEntries.sort((left, right) => {
-        const priorityDiff =
-          clampToNonNegativeInt(right.smartFillPriority, 0) -
-          clampToNonNegativeInt(left.smartFillPriority, 0);
-        if (priorityDiff !== 0) {
-          return priorityDiff;
-        }
-
         const debtDiff = (right.debtTurns || 0) - (left.debtTurns || 0);
         if (debtDiff !== 0) {
           return debtDiff;
