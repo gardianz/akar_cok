@@ -9784,8 +9784,7 @@ async function runStartupBalanceWarmup(context) {
   );
 
   const warmupArgs = {
-    ...(isObject(context && context.args) ? context.args : {}),
-    noDashboard: true
+    ...(isObject(context && context.args) ? context.args : {})
   };
 
   for (let index = 0; index < selectedAccounts.length; index += 1) {
