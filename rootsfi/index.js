@@ -719,7 +719,11 @@ function buildInternalSendRequests(
   options = null
 ) {
   const validAccounts = Array.isArray(accounts)
-    ? accounts.filter((acc) => String(acc && acc.address ? acc.address : "").trim())
+    ? accounts.filter((acc) => {
+        const name = String(acc && acc.name ? acc.name : "").trim();
+        const address = String(acc && acc.address ? acc.address : "").trim();
+        return Boolean(address) && Boolean(name) && isEligibleForTierDailyTransfer(sendPolicy, name);
+      })
     : [];
   const avoidRecipientsSet = new Set(
     Array.isArray(avoidRecipientNames)
@@ -789,6 +793,10 @@ function buildInternalSendRequests(
     }
 
     if (isAccountQuarantined(recipient.name)) {
+      continue;
+    }
+
+    if (!isEligibleForTierDailyTransfer(sendPolicy, recipient.name)) {
       continue;
     }
 
@@ -3846,7 +3854,11 @@ function getAccountTierDailyTxCap(config, accountName) {
   const tierKey = getAccountTierKey(accountName);
   const caps = isObject(config && config.send && config.send.tierDailyTxCap)
     ? config.send.tierDailyTxCap
-    : INTERNAL_API_DEFAULTS.send.tierDailyTxCap;
+    : (
+        isObject(config && config.tierDailyTxCap)
+          ? config.tierDailyTxCap
+          : INTERNAL_API_DEFAULTS.send.tierDailyTxCap
+      );
   const cap = Number(caps[tierKey]);
   if (!Number.isFinite(cap) || cap <= 0) {
     return 0;
@@ -3861,6 +3873,10 @@ function hasReachedAccountTierDailyTxCap(config, accountName) {
   }
   const stats = getPerAccountTxStats(accountName);
   return stats.total >= cap;
+}
+
+function isEligibleForTierDailyTransfer(config, accountName) {
+  return !hasReachedAccountTierDailyTxCap(config, accountName);
 }
 
 function getAccountHourlyTxCap(config) {
@@ -4181,7 +4197,12 @@ function computeRoundSendPlan(sortedAccounts, accountSnapshots = {}, sendPolicy 
     ? sortedAccounts.filter((account) => {
         const name = String(account && account.name ? account.name : "").trim();
         const address = String(account && account.address ? account.address : "").trim();
-        return Boolean(name) && Boolean(address) && !isAccountQuarantined(name);
+        return (
+          Boolean(name) &&
+          Boolean(address) &&
+          !isAccountQuarantined(name) &&
+          isEligibleForTierDailyTransfer(config, name)
+        );
       })
     : [];
   const plan = new Map();
@@ -4220,6 +4241,18 @@ function computeRoundSendPlan(sortedAccounts, accountSnapshots = {}, sendPolicy 
     }
     return left.localeCompare(right);
   });
+  const roundBalanceSeedLabel = sortedByBalanceDesc
+    .map((name) => {
+      const balance = Number(projectedBalances.get(name));
+      const balanceLabel = Number.isFinite(balance)
+        ? balance.toFixed(3).replace(/\.?0+$/, "")
+        : "unknown";
+      return `${name}(${balanceLabel})`;
+    })
+    .join(" -> ");
+  if (roundBalanceSeedLabel) {
+    console.log(`[internal-chain] Round balance seed: ${roundBalanceSeedLabel}`);
+  }
 
   const unsentNames = new Set(allNames);
   let currentSender = sortedByBalanceDesc[0] || "";
@@ -4732,14 +4765,20 @@ function buildDependencyAwareWorkerBatches(executionEntries, workerCount) {
   return batches;
 }
 
-function selectHybridRefundTarget(sourceAccount, selectedAccounts, accountSnapshots) {
+function selectHybridRefundTarget(sourceAccount, selectedAccounts, accountSnapshots, config = null) {
   const sourceName = String(sourceAccount && sourceAccount.name ? sourceAccount.name : "").trim();
   const candidates = Array.isArray(selectedAccounts)
     ? selectedAccounts
         .filter((account) => {
           const name = String(account && account.name ? account.name : "").trim();
           const address = String(account && account.address ? account.address : "").trim();
-          return Boolean(name) && Boolean(address) && name !== sourceName && !isAccountQuarantined(name);
+          return (
+            Boolean(name) &&
+            Boolean(address) &&
+            name !== sourceName &&
+            !isAccountQuarantined(name) &&
+            isEligibleForTierDailyTransfer(config, name)
+          );
         })
         .map((account) => {
           const name = String(account.name || "").trim();
@@ -4777,13 +4816,13 @@ function selectHybridRefundTarget(sourceAccount, selectedAccounts, accountSnapsh
   return pool[randomIntInclusive(0, pool.length - 1)].account || null;
 }
 
-function buildRoundRefundPriorityTargets(selectedAccounts, accountSnapshots) {
+function buildRoundRefundPriorityTargets(selectedAccounts, accountSnapshots, config = null) {
   const candidates = Array.isArray(selectedAccounts)
     ? selectedAccounts
         .filter((account) => {
           const name = String(account && account.name ? account.name : "").trim();
           const address = String(account && account.address ? account.address : "").trim();
-          return Boolean(address) && !isAccountQuarantined(name);
+          return Boolean(address) && !isAccountQuarantined(name) && isEligibleForTierDailyTransfer(config, name);
         })
         .map((account) => {
           const name = String(account && account.name ? account.name : "").trim();
@@ -4816,8 +4855,8 @@ function buildRoundRefundPriorityTargets(selectedAccounts, accountSnapshots) {
   return candidates;
 }
 
-function assignHybridRefundTargetsForRoundPass(roundResults, selectedAccounts, accountSnapshots) {
-  const priorityTargets = buildRoundRefundPriorityTargets(selectedAccounts, accountSnapshots).map((entry) => ({
+function assignHybridRefundTargetsForRoundPass(roundResults, selectedAccounts, accountSnapshots, config = null) {
+  const priorityTargets = buildRoundRefundPriorityTargets(selectedAccounts, accountSnapshots, config).map((entry) => ({
     ...entry,
     projectedBalance: Number.isFinite(entry.balance) ? entry.balance : Number.POSITIVE_INFINITY
   }));
@@ -8499,7 +8538,8 @@ async function processWalleyRefundsForBatch(
   sendBatchResult,
   accountLogTag = null,
   selectedAccounts = [],
-  accountSnapshots = {}
+  accountSnapshots = {},
+  config = null
 ) {
   if (
     !walleyRefundBridge ||
@@ -8553,7 +8593,8 @@ async function processWalleyRefundsForBatch(
     const refundTarget = selectHybridRefundTarget(
       rootsfiAccount,
       selectedAccounts,
-      accountSnapshots
+      accountSnapshots,
+      config
     );
 
     if (!refundTarget) {
@@ -8617,6 +8658,7 @@ async function processWalleyRefundsForRoundPass(
   totalLoopRounds,
   selectedAccounts,
   accountSnapshots,
+  config = null,
   refundParallelOptions = {}
 ) {
   if (
@@ -8654,7 +8696,8 @@ async function processWalleyRefundsForRoundPass(
     const { priorityTargets, assignments } = assignHybridRefundTargetsForRoundPass(
       roundResults,
       selectedAccounts,
-      accountSnapshots
+      accountSnapshots,
+      config
     );
 
     if (priorityTargets.length > 0) {
@@ -9959,7 +10002,8 @@ async function processAccount(context) {
               sendBatchResult,
               accountLogTag,
               selectedAccounts,
-              accountSnapshots
+              accountSnapshots,
+              accountConfig
             );
           } else if (
             walleyRefundBridge &&
@@ -10310,7 +10354,8 @@ async function processAccount(context) {
           sendBatchResult,
           accountLogTag,
           selectedAccounts,
-          accountSnapshots
+          accountSnapshots,
+          accountConfig
         );
       } else if (
         walleyRefundBridge &&
@@ -10403,20 +10448,49 @@ async function runStartupBalanceWarmup(context) {
     return;
   }
 
+  await refreshBalanceSnapshots(context, selectedAccounts, {
+    logPrefix: "startup",
+    startMessage: `Warmup started: refreshing balance and rewards for ${selectedAccounts.length} account(s) before hourly cycle execution`,
+    loopRound: 1,
+    totalLoopRounds: 1,
+    noDashboard: false
+  });
+}
+
+async function refreshBalanceSnapshots(
+  context,
+  selectedAccounts,
+  {
+    logPrefix = "warmup",
+    startMessage = "",
+    loopRound = 1,
+    totalLoopRounds = 1,
+    noDashboard = false
+  } = {}
+) {
+  const accountsToRefresh = Array.isArray(selectedAccounts)
+    ? selectedAccounts.filter((account) => account && String(account.name || "").trim())
+    : [];
+  if (accountsToRefresh.length === 0) {
+    return;
+  }
+
   const accountSnapshots =
     isObject(context && context.accountSnapshots) ? context.accountSnapshots : {};
   context.accountSnapshots = accountSnapshots;
 
-  console.log(
-    `[startup] Warmup started: refreshing balance and rewards for ${selectedAccounts.length} account(s) before hourly cycle execution`
-  );
+  const safeLogPrefix = String(logPrefix || "warmup").trim() || "warmup";
+  if (startMessage) {
+    console.log(`[${safeLogPrefix}] ${startMessage}`);
+  }
 
   const warmupArgs = {
-    ...(isObject(context && context.args) ? context.args : {})
+    ...(isObject(context && context.args) ? context.args : {}),
+    noDashboard: noDashboard || Boolean(context && context.args && context.args.noDashboard)
   };
 
-  for (let index = 0; index < selectedAccounts.length; index += 1) {
-    const account = selectedAccounts[index];
+  for (let index = 0; index < accountsToRefresh.length; index += 1) {
+    const account = accountsToRefresh[index];
     const accountToken = context.tokens.accounts[account.name] || normalizeTokenProfile({});
     context.tokens.accounts[account.name] = accountToken;
 
@@ -10431,13 +10505,13 @@ async function runStartupBalanceWarmup(context) {
         recipientsInfo: context.recipientsInfo,
         args: warmupArgs,
         accountIndex: index,
-        totalAccounts: selectedAccounts.length,
-        selectedAccounts,
+        totalAccounts: accountsToRefresh.length,
+        selectedAccounts: accountsToRefresh,
         accountSnapshots,
         telegramReporter: null,
         walleyRefundBridge: null,
-        loopRound: 1,
-        totalLoopRounds: 1,
+        loopRound,
+        totalLoopRounds,
         hybridAssignedMode: null,
         deferWalleyRefundsToRoundLevel: true,
         maxLoopTxOverride: null,
@@ -10446,15 +10520,53 @@ async function runStartupBalanceWarmup(context) {
         preferredInternalRecipients: [],
         plannedInternalAmount: null
       });
-      console.log(`[startup] Warmup ${index + 1}/${selectedAccounts.length}: ${account.name} ready`);
+      console.log(`[${safeLogPrefix}] ${index + 1}/${accountsToRefresh.length}: ${account.name} ready`);
     } catch (error) {
       console.log(
-        `[startup] Warmup ${index + 1}/${selectedAccounts.length}: ${account.name} failed -> ${error.message}`
+        `[${safeLogPrefix}] ${index + 1}/${accountsToRefresh.length}: ${account.name} failed -> ${error.message}`
       );
     }
   }
 
-  console.log("[startup] Warmup completed.\n");
+  console.log(`[${safeLogPrefix}] completed.\n`);
+}
+
+async function ensureRoundPlanningBalances(context, selectedAccounts, loopRound, totalLoopRounds) {
+  if (!Array.isArray(selectedAccounts) || selectedAccounts.length === 0) {
+    return [];
+  }
+
+  if (isObject(context && context.args) && context.args.dryRun) {
+    return selectedAccounts
+      .filter((account) => !Number.isFinite(getPlanningCcBalance(account && account.name, context.accountSnapshots, Number.NaN)))
+      .map((account) => String(account && account.name ? account.name : "").trim())
+      .filter(Boolean);
+  }
+
+  const missingAccounts = selectedAccounts.filter((account) => {
+    return !Number.isFinite(getPlanningCcBalance(account && account.name, context.accountSnapshots, Number.NaN));
+  });
+  if (missingAccounts.length === 0) {
+    return [];
+  }
+
+  const missingNamesLabel = missingAccounts.map((account) => String(account.name || "").trim()).join(", ");
+  console.log(
+    `[internal-chain] Round ${loopRound}/${totalLoopRounds}: refreshing missing planning balances for ${missingAccounts.length} account(s): ${missingNamesLabel}`
+  );
+
+  await refreshBalanceSnapshots(context, missingAccounts, {
+    logPrefix: `round-balance ${loopRound}/${totalLoopRounds}`,
+    startMessage: `balance refresh before chain planning (${missingAccounts.length} account(s))`,
+    loopRound,
+    totalLoopRounds,
+    noDashboard: true
+  });
+
+  return missingAccounts
+    .filter((account) => !Number.isFinite(getPlanningCcBalance(account && account.name, context.accountSnapshots, Number.NaN)))
+    .map((account) => String(account && account.name ? account.name : "").trim())
+    .filter(Boolean);
 }
 
 async function runDailyCycle(context) {
@@ -10624,8 +10736,8 @@ async function runDailyCycle(context) {
   } else {
     if (sendMode === "internal") {
       console.log(
-        `[cycle] Worker mode: internal-chain runs dependency-safe sequential ` +
-        `(configured workers=${workerCount}; delay between accounts ${accountDelayMinSec}-${accountDelayMaxSec}s)`
+        `[cycle] Worker mode: internal-chain uses dependency-safe worker relay ` +
+        `(workers=${workerCount}; sender order follows sequential chain; handoff settle delay ${accountDelayMinSec}-${accountDelayMaxSec}s)`
       );
     } else {
       console.log(
@@ -10645,13 +10757,12 @@ async function runDailyCycle(context) {
     
     const configuredWorkerCount = forceSequentialAllRounds ? 1 : workerCount;
     const chainDependencyMode = sendMode === "internal";
-    const effectiveWorkerCount = chainDependencyMode
-      ? 1
-      : configuredWorkerCount;
+    const chainWorkerRelayEnabled = chainDependencyMode && configuredWorkerCount > 1;
+    const effectiveWorkerCount = configuredWorkerCount;
     const executionMode =
-      effectiveWorkerCount > 1
-        ? `WORKERS x${effectiveWorkerCount}`
-        : (chainDependencyMode ? "SEQUENTIAL (chain dependency)" : "SEQUENTIAL");
+      chainDependencyMode
+        ? (chainWorkerRelayEnabled ? `WORKER RELAY x${configuredWorkerCount}` : "SEQUENTIAL (chain dependency)")
+        : (effectiveWorkerCount > 1 ? `WORKERS x${effectiveWorkerCount}` : "SEQUENTIAL");
     
     console.log(`\n[cycle] Round ${loopRound}/${totalLoopRounds} started (${executionMode})`);
 
@@ -10700,6 +10811,25 @@ async function runDailyCycle(context) {
         deferReason: "",
         debtTurns: 0
       });
+    }
+
+    if (sendMode === "internal" || sendMode === "hybrid") {
+      const unresolvedBalanceNames = await ensureRoundPlanningBalances(
+        context,
+        pendingEntries.map((entry) => entry.account),
+        loopRound,
+        totalLoopRounds
+      );
+      if (unresolvedBalanceNames.length > 0) {
+        const unresolvedSet = new Set(unresolvedBalanceNames);
+        console.log(
+          `[internal-chain] Round ${loopRound}/${totalLoopRounds}: skip accounts without valid balance snapshot: ${unresolvedBalanceNames.join(", ")}`
+        );
+        pendingEntries = pendingEntries.filter((entry) => {
+          const accountName = String(entry.account && entry.account.name ? entry.account.name : "").trim();
+          return !unresolvedSet.has(accountName);
+        });
+      }
     }
 
     const hybridRoundAssignments =
@@ -10785,7 +10915,9 @@ async function runDailyCycle(context) {
       }
 
       const executionEntries = readyEntries;
-      const flowLabel = effectiveWorkerCount > 1 ? `workers=${effectiveWorkerCount}` : "sequential";
+      const flowLabel = chainDependencyMode
+        ? (chainWorkerRelayEnabled ? `worker-relay=${configuredWorkerCount}` : "sequential")
+        : (effectiveWorkerCount > 1 ? `workers=${effectiveWorkerCount}` : "sequential");
       const roundPlanOrder = Array.from(roundSendPlan.keys());
       const roundPlanOrderMap = new Map(roundPlanOrder.map((name, index) => [name, index]));
       executionEntries.sort((left, right) => {
@@ -10802,14 +10934,20 @@ async function runDailyCycle(context) {
       });
 
       let roundResults = [];
-      const runOneEntry = async (entry, indexInRound) => {
+      const runOneEntry = async (entry, indexInRound, workerSlot = null) => {
         const account = entry.account;
         const senderPlan = isObject(roundSendPlan.get(entry.account.name))
           ? roundSendPlan.get(entry.account.name)
           : {};
         const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
         tokens.accounts[account.name] = accountToken;
-        console.log(`[${flowLabel}] [${indexInRound + 1}/${executionEntries.length}] Processing ${account.name}...`);
+        const workerSlotLabel =
+          chainWorkerRelayEnabled && Number.isFinite(Number(workerSlot)) && Number(workerSlot) > 0
+            ? ` [w${Number(workerSlot)}]`
+            : "";
+        console.log(
+          `[${flowLabel}]${workerSlotLabel} [${indexInRound + 1}/${executionEntries.length}] Processing ${account.name}...`
+        );
 
         const expectedInboundFrom = String(senderPlan.expectedInboundFrom || "").trim();
         if (
@@ -10891,7 +11029,8 @@ async function runDailyCycle(context) {
       const readyOrderLabel = executionEntries.map((item) => item.account.name).join(" -> ");
       if (chainDependencyMode) {
         console.log(
-          `[${flowLabel}] Processing ${executionEntries.length} accounts in chain order: ${readyOrderLabel}`
+          `[${flowLabel}] Processing ${executionEntries.length} accounts in chain order: ${readyOrderLabel}` +
+          `${chainWorkerRelayEnabled ? ` (relay w1..w${configuredWorkerCount})` : ""}`
         );
       } else {
         const batches = [];
@@ -10933,7 +11072,10 @@ async function runDailyCycle(context) {
           }
 
           const [entry] = remainingEntries.splice(nextIndex, 1);
-          const batchResult = await runOneEntry(entry, processedCount);
+          const workerSlot = chainWorkerRelayEnabled
+            ? ((processedCount % configuredWorkerCount) + 1)
+            : null;
+          const batchResult = await runOneEntry(entry, processedCount, workerSlot);
           roundResults.push(batchResult);
           processedCount += 1;
 
@@ -10945,9 +11087,13 @@ async function runDailyCycle(context) {
             return String(candidate.account && candidate.account.name ? candidate.account.name : "") === actualRecipient;
           });
           if (actualRecipient) {
+            const nextWorkerSlotLabel =
+              chainWorkerRelayEnabled && recipientStillPending
+                ? ` (next sender queued for w${((processedCount % configuredWorkerCount) + 1)})`
+                : "";
             console.log(
               `[internal-chain] Handoff ${entry.account.name} -> ${actualRecipient}` +
-              `${recipientStillPending ? " (next sender locked)" : " (recipient already done/skipped)"}`
+              `${recipientStillPending ? nextWorkerSlotLabel || " (next sender locked)" : " (recipient already done/skipped)"}`
             );
           }
           nextSenderName = recipientStillPending ? actualRecipient : "";
@@ -10962,6 +11108,7 @@ async function runDailyCycle(context) {
         totalLoopRounds,
         sortedAccounts,
         accountSnapshots,
+        config,
         {
           parallelEnabled: walleyRefundBridge ? walleyRefundBridge.parallelEnabled : true,
           transferConcurrency: walleyRefundBridge ? walleyRefundBridge.maxConcurrency : 1,
